@@ -12,6 +12,9 @@ Usage:
   python main.py preferences set KEY VALUE
   python main.py preferences learn
   python main.py chat
+  python main.py digest                      # One-shot: fetch → analyze → email
+  python main.py schedule                    # Daemon: auto-run every Monday AM
+  python main.py setup-ollama [--model X]    # Check/pull Ollama model
 """
 
 import click
@@ -24,16 +27,21 @@ from ui.cli import (
     report,
     preferences,
     chat,
+    digest,
+    schedule_daemon,
+    setup_ollama,
 )
 
 
 @click.group()
-@click.version_option("1.0.0", prog_name="government-agent")
+@click.version_option("2.0.0", prog_name="government-agent")
 def cli() -> None:
     """Personal shareholder governance agent.
 
     Monitors proxy votes for your portfolio companies, makes AI-powered
     voting recommendations, and escalates important decisions to you.
+
+    Supports both Anthropic (cloud) and Ollama (local) LLM backends.
 
     Portfolio: SYF OXY TTE WISE BABA BIDU TSLA GOOGL NVDA
                DOYU AAL USB STZ POOL LEN 1810.HK UNH
@@ -47,6 +55,9 @@ cli.add_command(review)
 cli.add_command(report)
 cli.add_command(preferences)
 cli.add_command(chat)
+cli.add_command(digest)
+cli.add_command(schedule_daemon, name="schedule")
+cli.add_command(setup_ollama, name="setup-ollama")
 
 
 if __name__ == "__main__":

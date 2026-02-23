@@ -2,7 +2,12 @@
 Portfolio configuration and constants for the governance agent.
 """
 
+import os
 from enum import Enum
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Portfolio companies
@@ -164,14 +169,50 @@ EXEC_COMP_IMPORTANCE_ESCALATE = 0.80
 
 
 # ---------------------------------------------------------------------------
-# Claude model config
+# LLM backend config
 # ---------------------------------------------------------------------------
 
-CLAUDE_MODEL = "claude-opus-4-6"
+# "anthropic" or "ollama"
+LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")
+
+# Anthropic
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MAX_TOKENS = 2048
 
-# Max characters of proxy HTML to pass to Claude for extraction
+# Ollama (local)
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+
+# ---------------------------------------------------------------------------
+# EDGAR config
+# ---------------------------------------------------------------------------
+
+# Max characters of proxy HTML to pass to LLM for extraction
 EDGAR_HTML_MAX_CHARS = 60_000
 
 # SEC EDGAR User-Agent (required by SEC policy — change to your contact info)
-EDGAR_USER_AGENT = "GovernanceAgent/1.0 personal-use"
+EDGAR_USER_AGENT = os.getenv(
+    "EDGAR_USER_AGENT",
+    "GovernanceAgent/1.0 personal-use"
+)
+
+# Local cache directory for EDGAR downloads
+EDGAR_CACHE_DIR = os.getenv("EDGAR_CACHE_DIR", ".cache/edgar")
+
+
+# ---------------------------------------------------------------------------
+# Scheduler + email config
+# ---------------------------------------------------------------------------
+
+# When to send the Monday morning digest (24h format)
+SCHEDULE_TIME = os.getenv("SCHEDULE_TIME", "08:00")
+SCHEDULE_DAY = os.getenv("SCHEDULE_DAY", "monday")
+
+# Email settings (for sending the weekly digest)
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_TO = os.getenv("EMAIL_TO", "")  # Recipient address (your email)

@@ -1,5 +1,8 @@
 """
-Claude-powered proposal analysis.
+LLM-powered proposal analysis.
+
+Uses the backend abstraction (agent.llm_backend) so it works with both
+Ollama (local) and Anthropic (cloud).
 
 Two main jobs:
   1. extract_ballot_items() — parse raw proxy text into structured proposals
@@ -8,17 +11,10 @@ Two main jobs:
 """
 
 import json
-import re
 from dataclasses import dataclass
 
-import anthropic
-
-from config import (
-    CLAUDE_MODEL,
-    CLAUDE_MAX_TOKENS,
-    ProposalType,
-    VoteChoice,
-)
+from config import ProposalType, VoteChoice
+from agent.llm_backend import LLMBackend, get_backend, parse_json_response
 from data.edgar import RawProposal
 
 
@@ -53,8 +49,8 @@ ballot item to be voted on at the annual/special meeting.
 
 For each item return:
   - proposal_number: string (e.g. "1", "2", "3a")
-  - title: short descriptive title (≤ 80 chars)
-  - description: 1–3 sentence summary of what the proposal does
+  - title: short descriptive title (80 chars max)
+  - description: 1-3 sentence summary of what the proposal does
   - management_recommendation: "FOR", "AGAINST", "ABSTAIN", or "" if not stated
 
 Return a JSON array of objects with these exact keys.
@@ -83,9 +79,9 @@ Evaluate this proposal against governance best practices AND the user's preferen
 Return a single JSON object with these exact keys (no code fences):
 {{
   "recommendation": "FOR" | "AGAINST" | "ABSTAIN",
-  "confidence": <float 0.0–1.0 — how certain you are this is the right vote>,
-  "importance": <float 0.0–1.0 — how consequential this vote is for the shareholder>,
-  "reasoning": "<2–4 sentence explanation>",
+  "confidence": <float 0.0-1.0 how certain you are this is the right vote>,
+  "importance": <float 0.0-1.0 how consequential this vote is for the shareholder>,
+  "reasoning": "<2-4 sentence explanation>",
   "governance_concerns": ["<specific concern 1>", ...],
   "aligned_preferences": ["<which user preference supports this recommendation>", ...],
   "conflicting_factors": ["<anything that creates uncertainty>", ...],
@@ -108,8 +104,8 @@ Return [] if no clear preferences can be extracted.
 
 
 class ProposalAnalyzer:
-    def __init__(self, api_key: str | None = None) -> None:
-        self.client = anthropic.Anthropic(api_key=api_key) if api_key else anthropic.Anthropic()
+    def __init__(self, backend: LLMBackend | None = None) -> None:
+        self.backend = backend or get_backend()
 
     # ------------------------------------------------------------------
     # Ballot item extraction from raw proxy text
@@ -117,9 +113,7 @@ class ProposalAnalyzer:
 
     def extract_ballot_items(self, text: str, ticker: str) -> list[RawProposal]:
         """Parse raw proxy statement text and return a list of RawProposal objects."""
-        response = self.client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
+        response = self.backend.chat(
             system=EXTRACTION_SYSTEM,
             messages=[
                 {
@@ -130,18 +124,14 @@ class ProposalAnalyzer:
                 }
             ],
         )
-        raw_text = response.content[0].text.strip()
-        # Strip accidental code fences
-        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
-        raw_text = re.sub(r"\n?```$", "", raw_text)
-
-        try:
-            items = json.loads(raw_text)
-        except json.JSONDecodeError:
+        items = parse_json_response(response.text)
+        if not isinstance(items, list):
             return []
 
         proposals = []
         for item in items:
+            if not isinstance(item, dict):
+                continue
             proposals.append(
                 RawProposal(
                     proposal_number=str(item.get("proposal_number", "")),
@@ -167,9 +157,7 @@ class ProposalAnalyzer:
         meeting_date: str,
         preferences_context: str,
     ) -> AnalysisResult:
-        """
-        Evaluate a ballot proposal and return a scored recommendation.
-        """
+        """Evaluate a ballot proposal and return a scored recommendation."""
         prompt = ANALYSIS_USER_TEMPLATE.format(
             company=company_name,
             ticker=ticker,
@@ -181,33 +169,24 @@ class ProposalAnalyzer:
             preferences_context=preferences_context,
         )
 
-        response = self.client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=CLAUDE_MAX_TOKENS,
+        response = self.backend.chat(
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
 
-        raw = response.content[0].text.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            # Graceful fallback if JSON is malformed
+        data = parse_json_response(response.text)
+        if not isinstance(data, dict):
             return AnalysisResult(
                 recommendation=VoteChoice.ABSTAIN.value,
                 confidence=0.0,
                 importance=0.5,
-                reasoning="Analysis failed — JSON parse error. Manual review required.",
-                governance_concerns=["Could not parse Claude response"],
+                reasoning="Analysis failed — could not parse LLM response. Manual review required.",
+                governance_concerns=["Could not parse response"],
                 aligned_preferences=[],
                 conflicting_factors=["Parse error"],
                 proposal_type=ProposalType.OTHER.value,
             )
 
-        # Clamp floats
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
         importance = max(0.0, min(1.0, float(data.get("importance", 0.5))))
 
@@ -231,9 +210,7 @@ class ProposalAnalyzer:
         Given a natural language statement, extract structured preference updates.
         Returns a list of {key, value, description} dicts.
         """
-        response = self.client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=512,
+        response = self.backend.chat(
             system=EXTRACTION_SYSTEM,
             messages=[
                 {
@@ -243,14 +220,10 @@ class ProposalAnalyzer:
                     ),
                 }
             ],
+            max_tokens=512,
         )
-        raw = response.content[0].text.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return []
+        result = parse_json_response(response.text)
+        return result if isinstance(result, list) else []
 
     # ------------------------------------------------------------------
     # Conversational Q&A
@@ -274,10 +247,9 @@ class ProposalAnalyzer:
         messages = [{"role": m["role"], "content": m["content"]} for m in history]
         messages.append({"role": "user", "content": user_message})
 
-        response = self.client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
+        response = self.backend.chat(
             system=system,
             messages=messages,
+            max_tokens=1024,
         )
-        return response.content[0].text
+        return response.text

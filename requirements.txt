@@ -1,7 +1,17 @@
+# LLM backends
 anthropic>=0.40.0
+
+# Data fetching & parsing
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+
+# Config
 python-dotenv>=1.0.0
+
+# CLI
 rich>=13.0.0
 click>=8.1.0
+
+# Scheduler
+schedule>=1.2.0

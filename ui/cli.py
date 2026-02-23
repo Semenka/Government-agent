@@ -2,13 +2,16 @@
 Click + Rich CLI for the governance agent.
 
 Commands:
-  fetch      — pull DEF 14A filings from SEC EDGAR (US tickers)
-  add        — manually enter ballot items (intl. companies)
-  analyze    — run AI analysis on pending proposals
-  review     — interactive queue for items needing human decision
-  report     — print voting report table
-  preferences list | set | learn  — manage preferences
-  chat       — freeform Q&A about governance or the portfolio
+  fetch        — pull DEF 14A filings from SEC EDGAR (US tickers)
+  add          — manually enter ballot items (intl. companies)
+  analyze      — run AI analysis on pending proposals
+  review       — interactive queue for items needing human decision
+  report       — print voting report table
+  preferences  — list | set | learn
+  chat         — freeform Q&A about governance
+  digest       — run full pipeline once (fetch→analyze→email)
+  schedule     — run as daemon, auto-trigger every Monday morning
+  setup-ollama — check Ollama status and pull model
 """
 
 import json
@@ -18,7 +21,6 @@ from pathlib import Path
 
 import click
 from dotenv import load_dotenv
-from rich import print as rprint
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -29,16 +31,11 @@ load_dotenv()
 
 console = Console()
 
-# Lazy imports inside commands to avoid import errors when API key is missing
-# for non-AI commands like `report` or `preferences list`.
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 VOTE_COLOR = {"FOR": "green", "AGAINST": "red", "ABSTAIN": "yellow", "WITHHOLD": "yellow"}
-SOURCE_LABEL = {True: "[yellow]REVIEW[/yellow]", False: "[cyan]AI[/cyan]"}
 
 
 def _ensure_db() -> None:
@@ -46,15 +43,28 @@ def _ensure_db() -> None:
     init_db()
 
 
-def _require_api_key() -> str:
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        console.print(
-            "[bold red]Error:[/bold red] ANTHROPIC_API_KEY not set. "
-            "Copy .env.example to .env and add your key."
-        )
-        sys.exit(1)
-    return key
+def _check_llm_backend() -> None:
+    """Verify the configured LLM backend is reachable."""
+    backend_type = os.getenv("LLM_BACKEND", "anthropic").lower()
+    if backend_type == "anthropic":
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
+            console.print(
+                "[bold red]Error:[/bold red] ANTHROPIC_API_KEY not set. "
+                "Copy .env.example to .env and add your key, or switch to Ollama."
+            )
+            sys.exit(1)
+    elif backend_type == "ollama":
+        from agent.llm_backend import OllamaBackend
+        model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+        url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+        backend = OllamaBackend(model=model, base_url=url)
+        if not backend.is_available():
+            console.print(
+                f"[bold red]Error:[/bold red] Ollama model '{model}' not available at {url}.\n"
+                f"Run [bold]python main.py setup-ollama[/bold] to fix this."
+            )
+            sys.exit(1)
 
 
 def _vote_cell(vote: str | None) -> Text:
@@ -74,7 +84,7 @@ def _vote_cell(vote: str | None) -> Text:
 def fetch(ticker: str | None, months: int) -> None:
     """Fetch DEF 14A proxy filings from SEC EDGAR for US portfolio companies."""
     _ensure_db()
-    _require_api_key()
+    _check_llm_backend()
 
     from config import EDGAR_TICKERS, MANUAL_TICKERS, PORTFOLIO
     from data.edgar import EDGARClient
@@ -128,7 +138,7 @@ def fetch(ticker: str | None, months: int) -> None:
                 console.print(f"    [red]Download failed: {exc}[/red]")
                 continue
 
-            console.print("    Extracting ballot items via Claude …")
+            console.print("    Extracting ballot items via LLM …")
             try:
                 proposals = client_edgar.extract_proposals_with_claude(text, t, analyzer)
             except Exception as exc:
@@ -141,7 +151,7 @@ def fetch(ticker: str | None, months: int) -> None:
 
             console.print(f"    Extracted {len(proposals)} ballot item(s):")
             for p in proposals:
-                pid = upsert_proposal(
+                upsert_proposal(
                     ticker=t,
                     company_name=company["name"],
                     proposal_number=p.proposal_number,
@@ -208,11 +218,17 @@ def add_proposal(ticker: str | None) -> None:
 def analyze(ticker: str | None) -> None:
     """Run AI analysis on all pending ballot proposals."""
     _ensure_db()
-    _require_api_key()
+    _check_llm_backend()
 
     from agent.decision_engine import DecisionEngine
 
-    console.print("[bold]Analyzing pending proposals …[/bold]\n")
+    backend_name = os.getenv("LLM_BACKEND", "anthropic")
+    model = os.getenv("OLLAMA_MODEL", os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"))
+    console.print(
+        f"[bold]Analyzing pending proposals[/bold] "
+        f"[dim](backend: {backend_name}, model: {model})[/dim]\n"
+    )
+
     engine = DecisionEngine()
     report = engine.process_all_pending(ticker=ticker, verbose=True)
 
@@ -238,7 +254,6 @@ def analyze(ticker: str | None) -> None:
 def review() -> None:
     """Interactive review queue — decide on proposals the AI flagged for you."""
     _ensure_db()
-    _require_api_key()
 
     from agent.decision_engine import DecisionEngine
 
@@ -347,7 +362,6 @@ def report(ticker: str | None, year: str | None) -> None:
         mgmt_rec = r["management_rec"] or "—"
         source = "User" if r["user_override"] else ("AI" if r["recommendation"] else "—")
         conf = f"{r['confidence']:.0%}" if r["confidence"] is not None else "—"
-        status = r["status"]
 
         vote_text = _vote_cell(final_vote)
         mgmt_text = _vote_cell(mgmt_rec if mgmt_rec != "—" else None)
@@ -407,12 +421,7 @@ def prefs_list() -> None:
 @click.argument("key")
 @click.argument("value")
 def prefs_set(key: str, value: str) -> None:
-    """Override a preference by dot-notation key.
-
-    Examples:
-      preferences set director_elections.attendance_threshold 0.8
-      preferences set executive_compensation.vote_against_pay_ratio_above 300
-    """
+    """Override a preference by dot-notation key."""
     _ensure_db()
 
     from agent.preference_engine import PreferenceEngine
@@ -423,12 +432,9 @@ def prefs_set(key: str, value: str) -> None:
 
 @preferences.command("learn")
 def prefs_learn() -> None:
-    """Enter a natural language statement to update your preferences.
-
-    Example: "I always vote against board members who sit on more than 3 other boards"
-    """
+    """Enter a natural language statement to update your preferences."""
     _ensure_db()
-    _require_api_key()
+    _check_llm_backend()
 
     from agent.analyzer import ProposalAnalyzer
     from agent.preference_engine import PreferenceEngine
@@ -445,7 +451,7 @@ def prefs_learn() -> None:
         extracted = prefs.learn_from_statement(statement, analyzer)
 
     if not extracted:
-        console.print("[yellow]Could not extract specific preferences from that statement. Try being more specific.[/yellow]")
+        console.print("[yellow]Could not extract specific preferences. Try being more specific.[/yellow]")
     else:
         console.print(f"[green]Learned {len(extracted)} preference(s):[/green]")
         for item in extracted:
@@ -461,7 +467,7 @@ def prefs_learn() -> None:
 def chat() -> None:
     """Conversational interface — ask governance questions or discuss your portfolio."""
     _ensure_db()
-    _require_api_key()
+    _check_llm_backend()
 
     from agent.analyzer import ProposalAnalyzer
     from agent.preference_engine import PreferenceEngine
@@ -470,10 +476,13 @@ def chat() -> None:
     analyzer = ProposalAnalyzer()
     prefs = PreferenceEngine()
 
+    backend_name = os.getenv("LLM_BACKEND", "anthropic")
     console.print(
         Panel(
-            "Ask anything about corporate governance, your portfolio companies, "
-            "or specific proposals.\nType [bold]exit[/bold] or [bold]quit[/bold] to leave.",
+            f"Ask anything about corporate governance, your portfolio companies, "
+            f"or specific proposals.\n"
+            f"Backend: [bold]{backend_name}[/bold]\n"
+            f"Type [bold]exit[/bold] or [bold]quit[/bold] to leave.",
             title="Governance Agent Chat",
             border_style="blue",
         )
@@ -501,3 +510,107 @@ def chat() -> None:
         history.append({"role": "assistant", "content": reply})
 
         console.print(Panel(reply, title="[bold green]Agent[/bold green]", border_style="green"))
+
+
+# ---------------------------------------------------------------------------
+# digest  (one-shot pipeline: fetch → analyze → email)
+# ---------------------------------------------------------------------------
+
+@click.command()
+def digest() -> None:
+    """Run the full pipeline once: fetch → analyze → send email digest."""
+    _ensure_db()
+    _check_llm_backend()
+
+    from scheduler import run_pipeline
+    run_pipeline(verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# schedule  (long-running daemon)
+# ---------------------------------------------------------------------------
+
+@click.command("schedule")
+def schedule_daemon() -> None:
+    """Run as a daemon — triggers the pipeline every Monday morning."""
+    _ensure_db()
+
+    from scheduler import run_daemon, print_cron_instructions
+
+    console.print(
+        Panel(
+            "The scheduler will run the full pipeline (fetch → analyze → email) "
+            "automatically. Keep this process running in the background.\n\n"
+            "Alternative: use a cron job instead (see below).",
+            title="Governance Agent Scheduler",
+            border_style="blue",
+        )
+    )
+    print_cron_instructions()
+    console.print("")
+
+    run_daemon(verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# setup-ollama
+# ---------------------------------------------------------------------------
+
+@click.command("setup-ollama")
+@click.option("--model", "-m", default=None, help="Ollama model to use (e.g. llama3.1:70b)")
+def setup_ollama(model: str | None) -> None:
+    """Check Ollama status and pull the configured model."""
+    from agent.llm_backend import OllamaBackend
+
+    model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+    url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+    console.print(f"Checking Ollama at [bold]{url}[/bold] …")
+
+    backend = OllamaBackend(model=model, base_url=url)
+
+    # Check connectivity
+    try:
+        import requests
+        resp = requests.get(f"{url}/api/tags", timeout=5)
+        resp.raise_for_status()
+        available = [m["name"] for m in resp.json().get("models", [])]
+        console.print(f"  [green]Ollama is running.[/green] Models available: {', '.join(available) or 'none'}")
+    except Exception:
+        console.print(
+            f"  [red]Cannot connect to Ollama at {url}.[/red]\n"
+            "  Install Ollama: https://ollama.com\n"
+            "  Then run: ollama serve"
+        )
+        return
+
+    if backend.is_available():
+        console.print(f"  [green]Model '{model}' is ready.[/green]")
+    else:
+        console.print(f"  Model '{model}' not found. Pulling …")
+        try:
+            backend.pull_model()
+            console.print(f"  [green]Model '{model}' pulled successfully.[/green]")
+        except Exception as exc:
+            console.print(f"  [red]Failed to pull model: {exc}[/red]")
+            return
+
+    # Quick test
+    console.print("  Running quick test …")
+    try:
+        resp = backend.chat(
+            system="Reply with exactly: OK",
+            messages=[{"role": "user", "content": "Test"}],
+            max_tokens=10,
+        )
+        console.print(f"  [green]Test passed.[/green] Response: {resp.text[:50]}")
+    except Exception as exc:
+        console.print(f"  [red]Test failed: {exc}[/red]")
+        return
+
+    console.print(
+        f"\n[bold]To use Ollama, set in your .env:[/bold]\n"
+        f"  LLM_BACKEND=ollama\n"
+        f"  OLLAMA_MODEL={model}\n"
+        f"  OLLAMA_URL={url}\n"
+    )

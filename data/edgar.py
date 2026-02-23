@@ -1,22 +1,23 @@
 """
 SEC EDGAR API client for fetching DEF 14A proxy filings.
 
-The SEC EDGAR free REST API is used:
-  https://data.sec.gov/submissions/CIK{cik}.json   — filing history
-  https://data.sec.gov/Archives/...                 — document downloads
-
-Per SEC policy the request must include a descriptive User-Agent header.
-Set EDGAR_USER_AGENT in config.py to your contact info.
+Optimizations over v1:
+  - Disk-based response caching (avoids re-downloading proxy statements)
+  - Retry with exponential backoff for network errors
+  - Connection pooling via requests.Session
 """
 
+import hashlib
+import os
 import time
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import EDGAR_USER_AGENT, EDGAR_HTML_MAX_CHARS
+from config import EDGAR_USER_AGENT, EDGAR_HTML_MAX_CHARS, EDGAR_CACHE_DIR
 
 
 @dataclass
@@ -24,7 +25,7 @@ class Filing:
     accession_number: str
     filing_date: str
     form_type: str
-    primary_document: str   # filename of the primary document in the filing
+    primary_document: str
     cik: str
 
 
@@ -36,6 +37,35 @@ class RawProposal:
     management_recommendation: str
 
 
+# ---------------------------------------------------------------------------
+# Disk cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_path(url: str) -> Path:
+    """Return a deterministic cache file path for a URL."""
+    h = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return Path(EDGAR_CACHE_DIR) / f"{h}.txt"
+
+
+def _read_cache(url: str) -> str | None:
+    """Return cached content for a URL, or None if not cached."""
+    p = _cache_path(url)
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+    return None
+
+
+def _write_cache(url: str, content: str) -> None:
+    """Write content to the disk cache."""
+    p = _cache_path(url)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class EDGARClient:
     BASE = "https://data.sec.gov"
 
@@ -44,30 +74,36 @@ class EDGARClient:
         self.session.headers.update({
             "User-Agent": EDGAR_USER_AGENT,
             "Accept-Encoding": "gzip, deflate",
-            "Host": "data.sec.gov",
         })
         self._last_request_time: float = 0.0
 
     # ------------------------------------------------------------------
-    # Rate-limit: EDGAR asks for max 10 req/s; we keep it at ~3 req/s
+    # Rate-limited GET with retry + exponential backoff
     # ------------------------------------------------------------------
-    def _get(self, url: str, **kwargs) -> requests.Response:
+    def _get(self, url: str, retries: int = 3, **kwargs) -> requests.Response:
+        # Rate limit: SEC allows 10 req/s; we stay at ~3 req/s
         elapsed = time.time() - self._last_request_time
         if elapsed < 0.35:
             time.sleep(0.35 - elapsed)
         self._last_request_time = time.time()
 
-        # Update host header for non-data.sec.gov domains
-        if "efts.sec.gov" in url:
-            self.session.headers["Host"] = "efts.sec.gov"
-        elif "www.sec.gov" in url:
-            self.session.headers["Host"] = "www.sec.gov"
-        else:
-            self.session.headers["Host"] = "data.sec.gov"
-
-        resp = self.session.get(url, timeout=30, **kwargs)
-        resp.raise_for_status()
-        return resp
+        for attempt in range(retries):
+            try:
+                resp = self.session.get(url, timeout=30, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt < retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
+                else:
+                    raise
+            except requests.HTTPError as exc:
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
+                else:
+                    raise
 
     # ------------------------------------------------------------------
     # Filing discovery
@@ -77,7 +113,16 @@ class EDGARClient:
         """Return DEF 14A filings from the past `months_back` months."""
         cik_padded = cik.lstrip("0").zfill(10)
         url = f"{self.BASE}/submissions/CIK{cik_padded}.json"
-        data = self._get(url).json()
+
+        # Check JSON cache
+        cached = _read_cache(url)
+        if cached:
+            import json
+            data = json.loads(cached)
+        else:
+            resp = self._get(url)
+            data = resp.json()
+            _write_cache(url, resp.text)
 
         cutoff = datetime.now() - timedelta(days=months_back * 30)
         filings: list[Filing] = []
@@ -102,7 +147,7 @@ class EDGARClient:
                 accession_number=accessions[i],
                 filing_date=date_str,
                 form_type=form,
-                primary_document=primary_docs[i] if primary_docs else "",
+                primary_document=primary_docs[i] if i < len(primary_docs) else "",
                 cik=cik_padded,
             ))
 
@@ -111,61 +156,65 @@ class EDGARClient:
     def get_filing_document_url(self, filing: Filing) -> str | None:
         """Return the URL of the primary proxy statement HTML document."""
         accession_clean = filing.accession_number.replace("-", "")
+        cik_int = int(filing.cik)
+
+        # Try to get the filing index
         index_url = (
-            f"{self.BASE}/Archives/edgar/data/{int(filing.cik)}/"
+            f"{self.BASE}/Archives/edgar/data/{cik_int}/"
             f"{accession_clean}/{filing.accession_number}-index.json"
         )
         try:
-            data = self._get(index_url).json()
+            resp = self._get(index_url)
+            data = resp.json()
+            for doc in data.get("directory", {}).get("item", []):
+                name = doc.get("name", "")
+                if name.endswith((".htm", ".html")) and "def14a" in name.lower():
+                    return (
+                        f"https://www.sec.gov/Archives/edgar/data/{cik_int}/"
+                        f"{accession_clean}/{name}"
+                    )
         except Exception:
-            # Fall back: construct URL directly from primary_document
-            if filing.primary_document:
-                return (
-                    f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/"
-                    f"{accession_clean}/{filing.primary_document}"
-                )
-            return None
+            pass
 
-        # Find the primary HTML document
-        for doc in data.get("documents", []):
-            if doc.get("type") in ("DEF 14A", "DEFA14A") and doc.get("document", "").endswith((".htm", ".html")):
-                return (
-                    f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/"
-                    f"{accession_clean}/{doc['document']}"
-                )
-        # Fallback to primary_document
+        # Fallback: use primary_document directly
         if filing.primary_document:
             return (
-                f"https://www.sec.gov/Archives/edgar/data/{int(filing.cik)}/"
+                f"https://www.sec.gov/Archives/edgar/data/{cik_int}/"
                 f"{accession_clean}/{filing.primary_document}"
             )
         return None
 
     def download_document_text(self, url: str) -> str:
-        """Download an HTML proxy statement and return cleaned text."""
-        # Use a separate session for sec.gov (different host)
+        """Download an HTML proxy statement, cache it, return cleaned text."""
+        cached = _read_cache(url)
+        if cached:
+            return cached
+
         headers = {
             "User-Agent": EDGAR_USER_AGENT,
             "Accept-Encoding": "gzip, deflate",
         }
         resp = requests.get(url, headers=headers, timeout=60)
         resp.raise_for_status()
+
         soup = BeautifulSoup(resp.text, "lxml")
-        # Remove scripts and styles
         for tag in soup(["script", "style", "head"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        return text[:EDGAR_HTML_MAX_CHARS]
+        text = text[:EDGAR_HTML_MAX_CHARS]
+
+        _write_cache(url, text)
+        return text
 
     # ------------------------------------------------------------------
-    # Proposal extraction (delegates to the Claude analyzer)
+    # Proposal extraction (delegates to the analyzer)
     # ------------------------------------------------------------------
 
     def extract_proposals_with_claude(
         self,
         text: str,
         ticker: str,
-        analyzer,  # agent.analyzer.ProposalAnalyzer
+        analyzer,
     ) -> list[RawProposal]:
-        """Use Claude to pull ballot items out of raw proxy text."""
+        """Use the LLM to pull ballot items out of raw proxy text."""
         return analyzer.extract_ballot_items(text, ticker)
