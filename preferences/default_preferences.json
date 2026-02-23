@@ -1,0 +1,111 @@
+{
+  "_comment": "Default corporate governance preferences. These reflect widely-accepted best-practice standards. Override any key via 'python main.py preferences set KEY VALUE' or 'preferences learn'.",
+
+  "director_elections": {
+    "vote_against_low_attendance": true,
+    "attendance_threshold": 0.75,
+    "comment_attendance": "Vote AGAINST any director who attended fewer than 75% of board/committee meetings without valid reason",
+
+    "vote_against_overboarded": true,
+    "max_directorships_ceo": 2,
+    "max_directorships_others": 4,
+    "comment_overboarding": "CEOs sitting on >2 outside public boards; others sitting on >4 public boards",
+
+    "support_board_gender_diversity": true,
+    "min_women_on_board_pct": 0.20,
+    "comment_diversity": "Vote AGAINST nominating committee chair if board is <20% women",
+
+    "prefer_independent_chair": true,
+    "comment_independent_chair": "Support shareholder proposals for independent board chair; vote AGAINST combined CEO/Chair unless strong lead independent director",
+
+    "vote_against_if_no_audit_independence": true,
+    "comment_audit_independence": "Vote AGAINST audit committee members if non-independent auditor relationship exists",
+
+    "support_annual_director_elections": true,
+    "comment_staggered_boards": "Oppose classified/staggered boards — all directors should face annual re-election"
+  },
+
+  "executive_compensation": {
+    "default_approach": "case_by_case",
+    "comment": "Evaluate pay-for-performance alignment; scrutinize peer group selection and pay mix",
+
+    "vote_against_pay_ratio_above": 500,
+    "comment_pay_ratio": "Vote AGAINST say-on-pay if CEO-to-median worker pay ratio exceeds 500x",
+
+    "vote_against_repricing_without_shareholder_approval": true,
+    "comment_repricing": "Underwater option repricing without shareholder approval is unacceptable",
+
+    "scrutinize_golden_parachutes": true,
+    "golden_parachute_multiplier_limit": 3,
+    "comment_parachutes": "Vote AGAINST excessive severance agreements exceeding 3x base+bonus",
+
+    "oppose_discretionary_bonuses_without_metrics": true,
+    "support_clawback_provisions": true,
+    "oppose_single_trigger_change_of_control": true
+  },
+
+  "auditor": {
+    "default_vote": "for",
+    "flag_tenure_above_years": 10,
+    "comment": "Routinely ratify auditor unless red flags; flag for review if auditor has served >10 years",
+
+    "vote_against_if_non_audit_fees_exceed_audit_pct": 50,
+    "comment_fees": "Scrutinize if non-audit fees exceed 50% of audit fees (potential independence issue)"
+  },
+
+  "esg_shareholder_proposals": {
+    "support_climate_risk_disclosure": true,
+    "comment_climate": "Support requests for TCFD-aligned climate risk reporting and emissions targets",
+
+    "support_political_spending_transparency": true,
+    "comment_political": "Support disclosure of corporate political spending and lobbying expenditures",
+
+    "support_diversity_reporting": true,
+    "comment_diversity_reporting": "Support EEO-1 disclosure and board diversity reporting",
+
+    "support_pay_equity_reporting": true,
+    "comment_pay_equity": "Support disclosure of gender and racial pay gap data",
+
+    "support_human_rights_reporting": true,
+    "evaluate_environmental_proposals_case_by_case": true
+  },
+
+  "governance_proposals": {
+    "support_majority_voting": true,
+    "comment_majority_voting": "Support majority vote standard for director elections (vs. plurality)",
+
+    "oppose_poison_pills": true,
+    "comment_poison_pills": "Vote AGAINST shareholder rights plans (poison pills) without shareholder approval",
+
+    "oppose_classified_boards": true,
+    "comment_classified": "Support annual elections; oppose multi-year terms for directors",
+
+    "support_proxy_access": true,
+    "comment_proxy_access": "Support 3%/3-year proxy access bylaws",
+
+    "oppose_supermajority_requirements": true,
+    "comment_supermajority": "Vote AGAINST supermajority vote requirements for routine matters",
+
+    "support_shareholder_right_to_call_special_meetings": true,
+    "special_meeting_threshold_pct": 10,
+
+    "oppose_fee_shifting_bylaws": true
+  },
+
+  "equity_plans": {
+    "evaluate_case_by_case": true,
+    "comment": "Always escalate to human review — dilution impact needs personal assessment",
+
+    "vote_against_if_evergreen_provision": true,
+    "comment_evergreen": "Oppose plans with automatic annual share replenishment (evergreen)",
+
+    "consider_overhang_pct_limit": 15,
+    "comment_overhang": "Flag plans where total potential dilution (overhang) exceeds 15% of shares outstanding"
+  },
+
+  "mergers_acquisitions": {
+    "evaluate_case_by_case": true,
+    "always_escalate": true,
+    "comment": "Always escalate to human review — M&A decisions require personal judgment on deal terms"
+  }
+}

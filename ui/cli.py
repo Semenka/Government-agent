@@ -1,0 +1,503 @@
+"""
+Click + Rich CLI for the governance agent.
+
+Commands:
+  fetch      — pull DEF 14A filings from SEC EDGAR (US tickers)
+  add        — manually enter ballot items (intl. companies)
+  analyze    — run AI analysis on pending proposals
+  review     — interactive queue for items needing human decision
+  report     — print voting report table
+  preferences list | set | learn  — manage preferences
+  chat       — freeform Q&A about governance or the portfolio
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import click
+from dotenv import load_dotenv
+from rich import print as rprint
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
+from rich.text import Text
+
+load_dotenv()
+
+console = Console()
+
+# Lazy imports inside commands to avoid import errors when API key is missing
+# for non-AI commands like `report` or `preferences list`.
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+VOTE_COLOR = {"FOR": "green", "AGAINST": "red", "ABSTAIN": "yellow", "WITHHOLD": "yellow"}
+SOURCE_LABEL = {True: "[yellow]REVIEW[/yellow]", False: "[cyan]AI[/cyan]"}
+
+
+def _ensure_db() -> None:
+    from data.storage import init_db
+    init_db()
+
+
+def _require_api_key() -> str:
+    key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not key:
+        console.print(
+            "[bold red]Error:[/bold red] ANTHROPIC_API_KEY not set. "
+            "Copy .env.example to .env and add your key."
+        )
+        sys.exit(1)
+    return key
+
+
+def _vote_cell(vote: str | None) -> Text:
+    if not vote:
+        return Text("—", style="dim")
+    color = VOTE_COLOR.get(vote, "white")
+    return Text(vote, style=f"bold {color}")
+
+
+# ---------------------------------------------------------------------------
+# fetch
+# ---------------------------------------------------------------------------
+
+@click.command()
+@click.option("--ticker", "-t", default=None, help="Fetch only this ticker (default: all EDGAR tickers)")
+@click.option("--months", "-m", default=18, show_default=True, help="How many months back to look")
+def fetch(ticker: str | None, months: int) -> None:
+    """Fetch DEF 14A proxy filings from SEC EDGAR for US portfolio companies."""
+    _ensure_db()
+    _require_api_key()
+
+    from config import EDGAR_TICKERS, MANUAL_TICKERS, PORTFOLIO
+    from data.edgar import EDGARClient
+    from agent.analyzer import ProposalAnalyzer
+    from data.storage import upsert_proposal
+
+    tickers = [ticker.upper()] if ticker else EDGAR_TICKERS
+
+    for t in tickers:
+        if t not in PORTFOLIO:
+            console.print(f"[yellow]Unknown ticker {t}, skipping.[/yellow]")
+            continue
+        if t in MANUAL_TICKERS:
+            console.print(
+                f"[yellow]{t} is an international company — use [bold]add[/bold] command instead.[/yellow]"
+            )
+            continue
+
+        company = PORTFOLIO[t]
+        cik = company["cik"]
+        console.print(f"\n[bold]{t}[/bold] ({company['name']}) — fetching filings …")
+
+        client_edgar = EDGARClient()
+        analyzer = ProposalAnalyzer()
+
+        try:
+            filings = client_edgar.get_recent_proxy_filings(cik, months_back=months)
+        except Exception as exc:
+            console.print(f"  [red]Failed to fetch filings: {exc}[/red]")
+            continue
+
+        if not filings:
+            console.print("  No DEF 14A filings found in that period.")
+            continue
+
+        console.print(f"  Found {len(filings)} filing(s).")
+        for filing in filings:
+            console.print(
+                f"  → {filing.form_type} filed {filing.filing_date} "
+                f"({filing.accession_number})"
+            )
+            url = client_edgar.get_filing_document_url(filing)
+            if not url:
+                console.print("    [yellow]Could not resolve document URL — skipping.[/yellow]")
+                continue
+
+            console.print(f"    Downloading: {url[:80]}…")
+            try:
+                text = client_edgar.download_document_text(url)
+            except Exception as exc:
+                console.print(f"    [red]Download failed: {exc}[/red]")
+                continue
+
+            console.print("    Extracting ballot items via Claude …")
+            try:
+                proposals = client_edgar.extract_proposals_with_claude(text, t, analyzer)
+            except Exception as exc:
+                console.print(f"    [red]Extraction failed: {exc}[/red]")
+                continue
+
+            if not proposals:
+                console.print("    [yellow]No ballot items found in this filing.[/yellow]")
+                continue
+
+            console.print(f"    Extracted {len(proposals)} ballot item(s):")
+            for p in proposals:
+                pid = upsert_proposal(
+                    ticker=t,
+                    company_name=company["name"],
+                    proposal_number=p.proposal_number,
+                    title=p.title,
+                    full_text=p.description,
+                    management_rec=p.management_recommendation,
+                    proposal_type="other",
+                    source="edgar",
+                    meeting_date="",
+                    filing_date=filing.filing_date,
+                    accession_number=filing.accession_number,
+                )
+                console.print(f"      #{p.proposal_number}: {p.title[:60]}")
+
+    console.print("\n[green]Fetch complete.[/green] Run [bold]analyze[/bold] next.")
+
+
+# ---------------------------------------------------------------------------
+# add  (manual entry for international companies)
+# ---------------------------------------------------------------------------
+
+@click.command("add")
+@click.option("--ticker", "-t", default=None, help="Ticker (e.g. TTE, WISE, 1810.HK)")
+def add_proposal(ticker: str | None) -> None:
+    """Manually enter ballot items for TTE, WISE, or 1810.HK."""
+    _ensure_db()
+
+    from config import MANUAL_TICKERS, PORTFOLIO
+    from data.manual_input import get_ir_hint, prompt_proposal_entry, save_manual_proposal
+
+    if ticker:
+        tickers = [ticker.upper()]
+    else:
+        tickers = MANUAL_TICKERS
+        console.print(
+            "[bold]International companies (manual entry):[/bold] "
+            + ", ".join(tickers)
+        )
+
+    for t in tickers:
+        if t not in PORTFOLIO:
+            console.print(f"[yellow]Unknown ticker {t}.[/yellow]")
+            continue
+        console.print(f"\n[dim]{get_ir_hint(t)}[/dim]")
+
+        while True:
+            fields = prompt_proposal_entry(t)
+            if not fields:
+                break
+            pid = save_manual_proposal(fields)
+            console.print(
+                f"  [green]Saved[/green] #{fields['proposal_number']}: {fields['title']} (id={pid})"
+            )
+            if not Confirm.ask("Add another proposal for this company?", default=False):
+                break
+
+
+# ---------------------------------------------------------------------------
+# analyze
+# ---------------------------------------------------------------------------
+
+@click.command()
+@click.option("--ticker", "-t", default=None, help="Analyze only this ticker")
+def analyze(ticker: str | None) -> None:
+    """Run AI analysis on all pending ballot proposals."""
+    _ensure_db()
+    _require_api_key()
+
+    from agent.decision_engine import DecisionEngine
+
+    console.print("[bold]Analyzing pending proposals …[/bold]\n")
+    engine = DecisionEngine()
+    report = engine.process_all_pending(ticker=ticker, verbose=True)
+
+    console.print(
+        f"\n[bold]Done.[/bold] "
+        f"Analyzed: {report.analyzed}/{report.total}  |  "
+        f"Auto-decided: {report.auto_decided}  |  "
+        f"[yellow]Needs review: {report.escalated}[/yellow]"
+    )
+    if report.errors:
+        console.print(f"[red]Errors ({len(report.errors)}):[/red]")
+        for e in report.errors:
+            console.print(f"  • {e}")
+    if report.escalated:
+        console.print("\nRun [bold]review[/bold] to handle items needing your input.")
+
+
+# ---------------------------------------------------------------------------
+# review  (human-in-the-loop)
+# ---------------------------------------------------------------------------
+
+@click.command()
+def review() -> None:
+    """Interactive review queue — decide on proposals the AI flagged for you."""
+    _ensure_db()
+    _require_api_key()
+
+    from agent.decision_engine import DecisionEngine
+
+    engine = DecisionEngine()
+    queue = engine.get_review_queue()
+
+    if not queue:
+        console.print("[green]No proposals need your review right now.[/green]")
+        return
+
+    console.print(
+        f"[bold]{len(queue)} proposal(s) need your input[/bold] "
+        "(sorted by importance, highest first)\n"
+    )
+
+    for i, row in enumerate(queue, 1):
+        concerns = json.loads(row["governance_concerns"] or "[]")
+        conflicts = json.loads(row["conflicting_factors"] or "[]")
+
+        panel_lines = [
+            f"[bold]{row['ticker']}[/bold] — {row['company_name']}",
+            f"Meeting: {row['meeting_date'] or 'unknown'}",
+            f"Proposal #{row['proposal_number']}: [bold]{row['title']}[/bold]",
+            f"Type: [dim]{row['proposal_type']}[/dim]",
+            "",
+            f"[bold]Proposal text:[/bold]",
+            (row["full_text"] or "[no text]")[:600],
+            "",
+            f"[bold]AI recommendation:[/bold] " + (
+                f"[{'green' if row['recommendation'] == 'FOR' else 'red' if row['recommendation'] == 'AGAINST' else 'yellow'}]"
+                f"{row['recommendation']}[/]"
+            ),
+            f"Confidence: {row['confidence']:.0%}  Importance: {row['importance']:.0%}",
+            "",
+            f"[bold]Reasoning:[/bold] {row['reasoning']}",
+        ]
+        if concerns:
+            panel_lines += ["", "[bold]Governance concerns:[/bold]"] + [f"  • {c}" for c in concerns]
+        if conflicts:
+            panel_lines += ["", "[bold]Why the AI is uncertain:[/bold]"] + [f"  • {c}" for c in conflicts]
+
+        console.print(
+            Panel(
+                "\n".join(panel_lines),
+                title=f"[bold]Item {i} of {len(queue)}[/bold]",
+                border_style="cyan",
+            )
+        )
+
+        vote = Prompt.ask(
+            "Your vote",
+            choices=["FOR", "AGAINST", "ABSTAIN", "SKIP"],
+            default="SKIP",
+        )
+        if vote == "SKIP":
+            console.print("[dim]Skipped.[/dim]\n")
+            continue
+
+        note = Prompt.ask("Add a note (optional)", default="")
+        engine.apply_user_vote(
+            decision_id=row["decision_id"],
+            vote=vote,
+            note=note,
+            learn=True,
+        )
+        console.print(f"  [green]Recorded: {vote}[/green]\n")
+
+    console.print("[bold]Review complete.[/bold] Run [bold]report[/bold] to see the full summary.")
+
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+
+@click.command()
+@click.option("--ticker", "-t", default=None, help="Filter by ticker")
+@click.option("--year", "-y", default=None, help="Filter by year (e.g. 2025)")
+def report(ticker: str | None, year: str | None) -> None:
+    """Print a voting report table for your portfolio."""
+    _ensure_db()
+
+    from data.storage import get_report_rows
+
+    rows = get_report_rows(ticker=ticker, year=year)
+    if not rows:
+        console.print("[yellow]No proposals found for the given filters.[/yellow]")
+        return
+
+    tbl = Table(
+        title="Governance Voting Report",
+        show_lines=True,
+        header_style="bold magenta",
+    )
+    tbl.add_column("Ticker", style="bold", width=8)
+    tbl.add_column("Date", width=11)
+    tbl.add_column("#", width=4)
+    tbl.add_column("Proposal", max_width=40)
+    tbl.add_column("Type", width=18)
+    tbl.add_column("Mgmt", width=8)
+    tbl.add_column("Vote", width=9)
+    tbl.add_column("Conf", width=6)
+    tbl.add_column("Source", width=8)
+
+    for r in rows:
+        final_vote = r["user_override"] or r["recommendation"]
+        mgmt_rec = r["management_rec"] or "—"
+        source = "User" if r["user_override"] else ("AI" if r["recommendation"] else "—")
+        conf = f"{r['confidence']:.0%}" if r["confidence"] is not None else "—"
+        status = r["status"]
+
+        vote_text = _vote_cell(final_vote)
+        mgmt_text = _vote_cell(mgmt_rec if mgmt_rec != "—" else None)
+        if mgmt_rec == "—":
+            mgmt_text = Text("—", style="dim")
+
+        flag = " [?]" if r["needs_review"] and not r["user_override"] else ""
+
+        tbl.add_row(
+            r["ticker"],
+            r["meeting_date"] or "—",
+            str(r["proposal_number"]),
+            (r["title"] or "")[:40] + flag,
+            (r["proposal_type"] or "").replace("_", " "),
+            mgmt_text,
+            vote_text,
+            conf,
+            source,
+        )
+
+    console.print(tbl)
+
+    pending = sum(1 for r in rows if r["status"] == "pending")
+    review_needed = sum(1 for r in rows if r["needs_review"] and not r["user_override"])
+    if pending:
+        console.print(f"\n[yellow]{pending} proposals still pending analysis.[/yellow] Run [bold]analyze[/bold].")
+    if review_needed:
+        console.print(f"[yellow]{review_needed} proposals need your review.[/yellow] Run [bold]review[/bold].")
+
+
+# ---------------------------------------------------------------------------
+# preferences
+# ---------------------------------------------------------------------------
+
+@click.group()
+def preferences() -> None:
+    """Manage your governance voting preferences."""
+
+
+@preferences.command("list")
+def prefs_list() -> None:
+    """Show all current preferences (defaults + your overrides)."""
+    _ensure_db()
+
+    from agent.preference_engine import PreferenceEngine
+    prefs = PreferenceEngine()
+    console.print(prefs.get_context())
+
+    overrides = prefs.list_overrides()
+    if overrides:
+        console.print(f"\n[bold]Your {len(overrides)} override(s) stored in DB:[/bold]")
+        for o in overrides:
+            console.print(f"  [cyan]{o['key']}[/cyan] = {o['value']}  [dim]({o['source']} · {o['created_at']})[/dim]")
+
+
+@preferences.command("set")
+@click.argument("key")
+@click.argument("value")
+def prefs_set(key: str, value: str) -> None:
+    """Override a preference by dot-notation key.
+
+    Examples:
+      preferences set director_elections.attendance_threshold 0.8
+      preferences set executive_compensation.vote_against_pay_ratio_above 300
+    """
+    _ensure_db()
+
+    from agent.preference_engine import PreferenceEngine
+    prefs = PreferenceEngine()
+    prefs.update(key, value, source="user_statement")
+    console.print(f"[green]Saved:[/green] {key} = {value}")
+
+
+@preferences.command("learn")
+def prefs_learn() -> None:
+    """Enter a natural language statement to update your preferences.
+
+    Example: "I always vote against board members who sit on more than 3 other boards"
+    """
+    _ensure_db()
+    _require_api_key()
+
+    from agent.analyzer import ProposalAnalyzer
+    from agent.preference_engine import PreferenceEngine
+
+    analyzer = ProposalAnalyzer()
+    prefs = PreferenceEngine()
+
+    console.print("[bold]Enter your preference statement[/bold] (or 'quit' to exit):")
+    statement = Prompt.ask(">")
+    if statement.lower() in ("quit", "q", ""):
+        return
+
+    with console.status("Extracting preferences …"):
+        extracted = prefs.learn_from_statement(statement, analyzer)
+
+    if not extracted:
+        console.print("[yellow]Could not extract specific preferences from that statement. Try being more specific.[/yellow]")
+    else:
+        console.print(f"[green]Learned {len(extracted)} preference(s):[/green]")
+        for item in extracted:
+            console.print(f"  [cyan]{item['key']}[/cyan] = {item['value']}")
+            console.print(f"    [dim]{item.get('description', '')}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# chat
+# ---------------------------------------------------------------------------
+
+@click.command()
+def chat() -> None:
+    """Conversational interface — ask governance questions or discuss your portfolio."""
+    _ensure_db()
+    _require_api_key()
+
+    from agent.analyzer import ProposalAnalyzer
+    from agent.preference_engine import PreferenceEngine
+    from data.storage import add_conversation_message, get_conversation_history
+
+    analyzer = ProposalAnalyzer()
+    prefs = PreferenceEngine()
+
+    console.print(
+        Panel(
+            "Ask anything about corporate governance, your portfolio companies, "
+            "or specific proposals.\nType [bold]exit[/bold] or [bold]quit[/bold] to leave.",
+            title="Governance Agent Chat",
+            border_style="blue",
+        )
+    )
+
+    history_rows = get_conversation_history(limit=20)
+    history = [{"role": r["role"], "content": r["content"]} for r in reversed(history_rows)]
+
+    while True:
+        user_msg = Prompt.ask("[bold blue]You[/bold blue]")
+        if user_msg.lower() in ("exit", "quit", "q"):
+            break
+
+        add_conversation_message("user", user_msg)
+
+        with console.status("Thinking …"):
+            reply = analyzer.chat(
+                user_message=user_msg,
+                history=history,
+                preferences_context=prefs.get_context(),
+            )
+
+        add_conversation_message("assistant", reply)
+        history.append({"role": "user", "content": user_msg})
+        history.append({"role": "assistant", "content": reply})
+
+        console.print(Panel(reply, title="[bold green]Agent[/bold green]", border_style="green"))
