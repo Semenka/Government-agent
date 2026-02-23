@@ -1,5 +1,6 @@
 # LLM backends
 anthropic>=0.40.0
+google-generativeai>=0.8.0
 
 # Data fetching & parsing
 requests>=2.31.0

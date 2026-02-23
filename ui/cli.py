@@ -11,7 +11,7 @@ Commands:
   chat         — freeform Q&A about governance
   digest       — run full pipeline once (fetch→analyze→email)
   schedule     — run as daemon, auto-trigger every Monday morning
-  setup-ollama — check Ollama status and pull model
+  setup-gemini — verify Gemini API key and test the model
 """
 
 import json
@@ -54,15 +54,13 @@ def _check_llm_backend() -> None:
                 "Copy .env.example to .env and add your key, or switch to Ollama."
             )
             sys.exit(1)
-    elif backend_type == "ollama":
-        from agent.llm_backend import OllamaBackend
-        model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-        url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-        backend = OllamaBackend(model=model, base_url=url)
-        if not backend.is_available():
+    elif backend_type == "gemini":
+        key = os.getenv("GEMINI_API_KEY", "")
+        if not key:
             console.print(
-                f"[bold red]Error:[/bold red] Ollama model '{model}' not available at {url}.\n"
-                f"Run [bold]python main.py setup-ollama[/bold] to fix this."
+                "[bold red]Error:[/bold red] GEMINI_API_KEY not set. "
+                "Get one at https://aistudio.google.com/apikey\n"
+                "Run [bold]python main.py setup-gemini[/bold] for help."
             )
             sys.exit(1)
 
@@ -110,8 +108,11 @@ def fetch(ticker: str | None, months: int) -> None:
         client_edgar = EDGARClient()
         analyzer = ProposalAnalyzer()
 
+        is_fpi = company.get("is_foreign_private_issuer", False)
         try:
-            filings = client_edgar.get_recent_proxy_filings(cik, months_back=months)
+            filings = client_edgar.get_recent_proxy_filings(
+                cik, months_back=months, is_foreign_private_issuer=is_fpi,
+            )
         except Exception as exc:
             console.print(f"  [red]Failed to fetch filings: {exc}[/red]")
             continue
@@ -176,7 +177,7 @@ def fetch(ticker: str | None, months: int) -> None:
 @click.command("add")
 @click.option("--ticker", "-t", default=None, help="Ticker (e.g. TTE, WISE, 1810.HK)")
 def add_proposal(ticker: str | None) -> None:
-    """Manually enter ballot items for TTE, WISE, or 1810.HK."""
+    """Manually enter ballot items for WISE or 1810.HK (or any ticker)."""
     _ensure_db()
 
     from config import MANUAL_TICKERS, PORTFOLIO
@@ -223,7 +224,7 @@ def analyze(ticker: str | None) -> None:
     from agent.decision_engine import DecisionEngine
 
     backend_name = os.getenv("LLM_BACKEND", "anthropic")
-    model = os.getenv("OLLAMA_MODEL", os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"))
+    model = os.getenv("GEMINI_MODEL", os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6"))
     console.print(
         f"[bold]Analyzing pending proposals[/bold] "
         f"[dim](backend: {backend_name}, model: {model})[/dim]\n"
@@ -553,64 +554,58 @@ def schedule_daemon() -> None:
 
 
 # ---------------------------------------------------------------------------
-# setup-ollama
+# setup-gemini
 # ---------------------------------------------------------------------------
 
-@click.command("setup-ollama")
-@click.option("--model", "-m", default=None, help="Ollama model to use (e.g. llama3.1:70b)")
-def setup_ollama(model: str | None) -> None:
-    """Check Ollama status and pull the configured model."""
-    from agent.llm_backend import OllamaBackend
+@click.command("setup-gemini")
+@click.option("--model", "-m", default=None, help="Gemini model (default: gemini-2.5-flash-lite)")
+def setup_gemini(model: str | None) -> None:
+    """Verify Gemini API key and test the model."""
+    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    api_key = os.getenv("GEMINI_API_KEY", "")
 
-    model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-    url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-
-    console.print(f"Checking Ollama at [bold]{url}[/bold] …")
-
-    backend = OllamaBackend(model=model, base_url=url)
-
-    # Check connectivity
-    try:
-        import requests
-        resp = requests.get(f"{url}/api/tags", timeout=5)
-        resp.raise_for_status()
-        available = [m["name"] for m in resp.json().get("models", [])]
-        console.print(f"  [green]Ollama is running.[/green] Models available: {', '.join(available) or 'none'}")
-    except Exception:
+    if not api_key:
         console.print(
-            f"  [red]Cannot connect to Ollama at {url}.[/red]\n"
-            "  Install Ollama: https://ollama.com\n"
-            "  Then run: ollama serve"
+            "[bold red]GEMINI_API_KEY not set.[/bold red]\n\n"
+            "1. Go to [bold]https://aistudio.google.com/apikey[/bold]\n"
+            "2. Create an API key\n"
+            "3. Add to your .env file:\n"
+            "   GEMINI_API_KEY=your-key-here\n"
         )
         return
 
-    if backend.is_available():
-        console.print(f"  [green]Model '{model}' is ready.[/green]")
+    console.print(f"Testing Gemini API with model [bold]{model}[/bold] …")
+
+    try:
+        from agent.llm_backend import GeminiBackend
+        backend = GeminiBackend(model=model, api_key=api_key)
+    except Exception as exc:
+        console.print(f"  [red]Failed to initialize: {exc}[/red]")
+        return
+
+    # List available models
+    console.print("  Checking available models …")
+    models = backend.list_models()
+    if models:
+        gemini_models = [m for m in models if "gemini" in m.lower()]
+        console.print(
+            f"  [green]API key valid.[/green] "
+            f"{len(gemini_models)} Gemini model(s) available."
+        )
     else:
-        console.print(f"  Model '{model}' not found. Pulling …")
-        try:
-            backend.pull_model()
-            console.print(f"  [green]Model '{model}' pulled successfully.[/green]")
-        except Exception as exc:
-            console.print(f"  [red]Failed to pull model: {exc}[/red]")
-            return
+        console.print("  [yellow]Could not list models (key may still work).[/yellow]")
 
     # Quick test
-    console.print("  Running quick test …")
-    try:
-        resp = backend.chat(
-            system="Reply with exactly: OK",
-            messages=[{"role": "user", "content": "Test"}],
-            max_tokens=10,
-        )
-        console.print(f"  [green]Test passed.[/green] Response: {resp.text[:50]}")
-    except Exception as exc:
-        console.print(f"  [red]Test failed: {exc}[/red]")
+    console.print(f"  Running test with {model} …")
+    if backend.test_connection():
+        console.print(f"  [green]Test passed.[/green] Model '{model}' is working.")
+    else:
+        console.print(f"  [red]Test failed.[/red] Check your API key and model name.")
         return
 
     console.print(
-        f"\n[bold]To use Ollama, set in your .env:[/bold]\n"
-        f"  LLM_BACKEND=ollama\n"
-        f"  OLLAMA_MODEL={model}\n"
-        f"  OLLAMA_URL={url}\n"
+        f"\n[bold]To use Gemini, set in your .env:[/bold]\n"
+        f"  LLM_BACKEND=gemini\n"
+        f"  GEMINI_API_KEY={api_key[:8]}…\n"
+        f"  GEMINI_MODEL={model}\n"
     )

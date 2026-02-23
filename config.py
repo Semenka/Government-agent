@@ -87,11 +87,13 @@ PORTFOLIO: dict[str, dict] = {
         "name": "UnitedHealth Group",
         "exchange": "NYSE",
     },
-    # International companies — no EDGAR CIK, manual ballot entry only
+    # TotalEnergies — French company, also listed on NYSE as ADR.
+    # Files 20-F and 6-K with SEC (foreign private issuer, no DEF 14A).
     "TTE": {
-        "cik": None,
+        "cik": "0000879764",
         "name": "TotalEnergies",
-        "exchange": "Euronext Paris",
+        "exchange": "NYSE",
+        "is_foreign_private_issuer": True,
         "ir_url": "https://totalenergies.com/investors",
     },
     "WISE": {
@@ -172,16 +174,16 @@ EXEC_COMP_IMPORTANCE_ESCALATE = 0.80
 # LLM backend config
 # ---------------------------------------------------------------------------
 
-# "anthropic" or "ollama"
+# "anthropic" or "gemini"
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")
 
 # Anthropic
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_MAX_TOKENS = 2048
 
-# Ollama (local)
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+# Gemini (Google AI)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 
 # ---------------------------------------------------------------------------

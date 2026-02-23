@@ -17,7 +17,13 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-from config import EDGAR_USER_AGENT, EDGAR_HTML_MAX_CHARS, EDGAR_CACHE_DIR
+from config import EDGAR_USER_AGENT, EDGAR_HTML_MAX_CHARS, EDGAR_CACHE_DIR, PORTFOLIO
+
+# Form types to look for when fetching proxy-related filings.
+# US domestic issuers file DEF 14A / DEFA14A.
+# Foreign private issuers (e.g. TTE) file 6-K which may contain AGM/proxy materials.
+PROXY_FORM_TYPES_DOMESTIC = {"DEF 14A", "DEFA14A"}
+PROXY_FORM_TYPES_FOREIGN = {"6-K", "6-K/A"}
 
 
 @dataclass
@@ -109,8 +115,19 @@ class EDGARClient:
     # Filing discovery
     # ------------------------------------------------------------------
 
-    def get_recent_proxy_filings(self, cik: str, months_back: int = 18) -> list[Filing]:
-        """Return DEF 14A filings from the past `months_back` months."""
+    def get_recent_proxy_filings(
+        self,
+        cik: str,
+        months_back: int = 18,
+        is_foreign_private_issuer: bool = False,
+    ) -> list[Filing]:
+        """
+        Return proxy-related filings from the past `months_back` months.
+
+        For domestic issuers: looks for DEF 14A / DEFA14A.
+        For foreign private issuers (e.g. TTE): looks for 6-K filings
+        that may contain AGM or proxy materials.
+        """
         cik_padded = cik.lstrip("0").zfill(10)
         url = f"{self.BASE}/submissions/CIK{cik_padded}.json"
 
@@ -127,6 +144,11 @@ class EDGARClient:
         cutoff = datetime.now() - timedelta(days=months_back * 30)
         filings: list[Filing] = []
 
+        target_forms = (
+            PROXY_FORM_TYPES_FOREIGN if is_foreign_private_issuer
+            else PROXY_FORM_TYPES_DOMESTIC
+        )
+
         recent = data.get("filings", {}).get("recent", {})
         form_types = recent.get("form", [])
         filing_dates = recent.get("filingDate", [])
@@ -134,7 +156,7 @@ class EDGARClient:
         primary_docs = recent.get("primaryDocument", [])
 
         for i, form in enumerate(form_types):
-            if form not in ("DEF 14A", "DEFA14A"):
+            if form not in target_forms:
                 continue
             date_str = filing_dates[i]
             try:

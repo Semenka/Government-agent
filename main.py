@@ -14,7 +14,7 @@ Usage:
   python main.py chat
   python main.py digest                      # One-shot: fetch → analyze → email
   python main.py schedule                    # Daemon: auto-run every Monday AM
-  python main.py setup-ollama [--model X]    # Check/pull Ollama model
+  python main.py setup-gemini [--model X]     # Verify Gemini API key + test
 """
 
 import click
@@ -29,7 +29,7 @@ from ui.cli import (
     chat,
     digest,
     schedule_daemon,
-    setup_ollama,
+    setup_gemini,
 )
 
 
@@ -41,7 +41,7 @@ def cli() -> None:
     Monitors proxy votes for your portfolio companies, makes AI-powered
     voting recommendations, and escalates important decisions to you.
 
-    Supports both Anthropic (cloud) and Ollama (local) LLM backends.
+    Supports both Anthropic (Claude) and Gemini (2.5 Flash-Lite) backends.
 
     Portfolio: SYF OXY TTE WISE BABA BIDU TSLA GOOGL NVDA
                DOYU AAL USB STZ POOL LEN 1810.HK UNH
@@ -57,7 +57,7 @@ cli.add_command(preferences)
 cli.add_command(chat)
 cli.add_command(digest)
 cli.add_command(schedule_daemon, name="schedule")
-cli.add_command(setup_ollama, name="setup-ollama")
+cli.add_command(setup_gemini, name="setup-gemini")
 
 
 if __name__ == "__main__":

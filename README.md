@@ -2,13 +2,15 @@
 
 A personal governance agent that monitors proxy votes for your portfolio companies, makes AI-powered voting recommendations, and escalates important decisions to you with full context.
 
-Supports both **Anthropic Claude** (cloud) and **Ollama** (fully local, private).
+Supports both **Gemini 2.5 Flash-Lite** (Google AI) and **Anthropic Claude** backends.
 
 ## Portfolio
 
 | US (EDGAR) | International (manual) |
 |---|---|
-| SYF, OXY, BABA, BIDU, TSLA, GOOGL, NVDA, DOYU, AAL, USB, STZ, POOL, LEN, UNH | TTE (Euronext Paris), WISE (LSE), 1810.HK (HKEX) |
+| SYF, OXY, TTE, BABA, BIDU, TSLA, GOOGL, NVDA, DOYU, AAL, USB, STZ, POOL, LEN, UNH | WISE (LSE), 1810.HK (HKEX) |
+
+TTE (TotalEnergies) is fetched from EDGAR via its NYSE listing (CIK 0000879764). As a foreign private issuer it files 6-K instead of DEF 14A.
 
 ## Setup
 
@@ -18,22 +20,21 @@ cp .env.example .env
 # Edit .env — see below for backend options
 ```
 
-### Option A: Anthropic (cloud)
+### Option A: Gemini 2.5 Flash-Lite (default)
+```bash
+python main.py setup-gemini               # Verify API key + test
+```
+```env
+LLM_BACKEND=gemini
+GEMINI_API_KEY=your-key-here              # https://aistudio.google.com/apikey
+GEMINI_MODEL=gemini-2.5-flash-lite
+```
+
+### Option B: Anthropic Claude
 ```env
 LLM_BACKEND=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### Option B: Ollama (local, private)
-```bash
-# Install Ollama: https://ollama.com
-ollama serve                          # Start the server
-python main.py setup-ollama           # Pull + verify the model
-```
-```env
-LLM_BACKEND=ollama
-OLLAMA_MODEL=llama3.1:8b              # or llama3.1:70b, qwen2.5:32b, mixtral:8x7b
-OLLAMA_URL=http://localhost:11434
+CLAUDE_MODEL=claude-sonnet-4-6
 ```
 
 ## Quick Start
@@ -43,16 +44,16 @@ OLLAMA_URL=http://localhost:11434
 python main.py digest
 
 # Or step by step:
-python main.py fetch                   # Pull proxy filings from SEC EDGAR
-python main.py add --ticker TTE        # Manual entry for international companies
-python main.py analyze                 # AI analysis on all pending proposals
-python main.py review                  # Decide on escalated items
-python main.py report --year 2025      # Print voting report table
+python main.py fetch                       # Pull proxy filings from SEC EDGAR
+python main.py add --ticker WISE           # Manual entry for international companies
+python main.py analyze                     # AI analysis on all pending proposals
+python main.py review                      # Decide on escalated items
+python main.py report --year 2025          # Print voting report table
 ```
 
 ## Monday Morning Digest
 
-The agent can automatically run the full pipeline (fetch → analyze → email) every Monday morning.
+The agent automatically runs the full pipeline (fetch → analyze → email) every Monday morning.
 
 ### Option 1: Built-in daemon
 ```bash
@@ -74,7 +75,7 @@ Configure in `.env`:
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USER=your-email@gmail.com
-SMTP_PASSWORD=your-app-password        # Gmail: use App Password
+SMTP_PASSWORD=your-app-password            # Gmail: use App Password
 EMAIL_FROM=your-email@gmail.com
 EMAIL_TO=your-email@gmail.com
 ```
@@ -91,14 +92,15 @@ python main.py preferences list
 python main.py preferences set director_elections.attendance_threshold 0.80
 python main.py preferences learn
 # > "I always vote against board members who sit on more than 3 other boards"
-python main.py chat                    # Freeform governance Q&A
+python main.py chat                        # Freeform governance Q&A
 ```
 
 ## How It Works
 
 ### Data Sources
 - **US companies**: SEC EDGAR DEF 14A filings (free API) with disk caching and retry logic
-- **International companies**: Manual entry via `add` command
+- **TTE (TotalEnergies)**: SEC EDGAR 6-K filings (foreign private issuer, NYSE-listed)
+- **International companies**: Manual entry via `add` command (WISE, 1810.HK)
 
 ### Decision Logic
 1. The LLM analyzes each proposal against your preferences and governance best practices
@@ -109,7 +111,7 @@ python main.py chat                    # Freeform governance Q&A
 - **Disk cache** for EDGAR downloads (avoids re-fetching proxy statements)
 - **Parallel analysis** via ThreadPoolExecutor (up to 4 proposals at once)
 - **Retry with exponential backoff** for network errors
-- **Robust JSON parsing** handles both Claude's clean output and Ollama's wrapped output
+- **Robust JSON parsing** handles both Claude and Gemini output formats
 
 ### Default Governance Principles (`preferences/default_preferences.json`)
 - Vote AGAINST directors with <75% meeting attendance
@@ -134,7 +136,7 @@ python main.py chat                    # Freeform governance Q&A
 │   ├── manual_input.py            # Manual ballot entry wizard
 │   └── storage.py                 # SQLite database layer
 ├── agent/
-│   ├── llm_backend.py             # Ollama + Anthropic abstraction
+│   ├── llm_backend.py             # Gemini + Anthropic abstraction
 │   ├── analyzer.py                # Proposal analysis via LLM
 │   ├── preference_engine.py       # Preference management + learning
 │   └── decision_engine.py         # Orchestration + parallel analysis

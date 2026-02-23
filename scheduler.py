@@ -68,7 +68,10 @@ def run_pipeline(verbose: bool = True) -> dict:
             print(f"\n  {ticker} ({company['name']}) …")
 
         try:
-            filings = client.get_recent_proxy_filings(cik, months_back=6)
+            is_fpi = company.get("is_foreign_private_issuer", False)
+            filings = client.get_recent_proxy_filings(
+                cik, months_back=6, is_foreign_private_issuer=is_fpi,
+            )
         except Exception as exc:
             summary["errors"].append(f"Fetch {ticker}: {exc}")
             if verbose:

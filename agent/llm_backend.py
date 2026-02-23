@@ -1,10 +1,8 @@
 """
-LLM backend abstraction — supports Ollama (local) and Anthropic (cloud).
+LLM backend abstraction — supports Gemini (Google) and Anthropic (Claude).
 
-Set LLM_BACKEND="ollama" in .env to run everything locally.
+Set LLM_BACKEND="gemini" in .env to use Gemini 2.5 Flash-Lite.
 Set LLM_BACKEND="anthropic" (default) to use Claude API.
-
-Ollama requires the ollama service running locally: https://ollama.com
 """
 
 import json
@@ -57,97 +55,87 @@ class AnthropicBackend(LLMBackend):
 
 
 # ---------------------------------------------------------------------------
-# Ollama backend
+# Gemini backend (Google AI — Gemini 2.5 Flash-Lite)
 # ---------------------------------------------------------------------------
 
-class OllamaBackend(LLMBackend):
+class GeminiBackend(LLMBackend):
     """
-    Calls the Ollama REST API at http://localhost:11434/api/chat.
+    Calls the Google Gemini API via the google-generativeai SDK.
 
-    Recommended models for governance analysis (in order of capability):
-      - llama3.1:70b     (best quality, needs ~40GB RAM)
-      - qwen2.5:32b      (strong, needs ~20GB RAM)
-      - mixtral:8x7b     (good balance, ~26GB RAM)
-      - llama3.1:8b      (lightweight, ~5GB RAM, lower quality)
-      - mistral:7b       (lightweight, ~5GB RAM)
+    Default model: gemini-2.5-flash-lite (fast, cheap, good for structured tasks).
+    Requires GEMINI_API_KEY in .env.
+
+    Get an API key at https://aistudio.google.com/apikey
     """
 
     def __init__(
         self,
-        model: str = "llama3.1:8b",
-        base_url: str = "http://localhost:11434",
+        model: str = "gemini-2.5-flash-lite",
+        api_key: str | None = None,
     ) -> None:
-        self.model = model
-        self.base_url = base_url.rstrip("/")
+        import google.generativeai as genai
+        api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "GEMINI_API_KEY not set. Get one at https://aistudio.google.com/apikey"
+            )
+        genai.configure(api_key=api_key)
+        self.model_name = model
+        self.genai = genai
 
     def chat(self, system: str, messages: list[dict], max_tokens: int = 2048) -> LLMResponse:
-        ollama_messages = [{"role": "system", "content": system}]
-        for m in messages:
-            ollama_messages.append({"role": m["role"], "content": m["content"]})
+        model = self.genai.GenerativeModel(
+            model_name=self.model_name,
+            system_instruction=system,
+            generation_config=self.genai.GenerationConfig(
+                temperature=0.3,
+                max_output_tokens=max_tokens,
+            ),
+        )
 
-        payload = {
-            "model": self.model,
-            "messages": ollama_messages,
-            "stream": False,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": 0.3,  # Lower temp for structured output
-            },
-        }
+        # Convert messages to Gemini content format
+        contents = []
+        for m in messages:
+            role = "user" if m["role"] == "user" else "model"
+            contents.append({"role": role, "parts": [m["content"]]})
 
         for attempt in range(3):
             try:
-                resp = requests.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                    timeout=300,  # Local models can be slow
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return LLMResponse(text=data["message"]["content"])
-            except requests.ConnectionError:
-                if attempt == 0:
-                    print(
-                        f"  [!] Cannot connect to Ollama at {self.base_url}. "
-                        "Make sure 'ollama serve' is running."
-                    )
-                raise
-            except requests.Timeout:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
-            except Exception:
-                if attempt < 2:
-                    time.sleep(1)
+                response = model.generate_content(contents=contents)
+                return LLMResponse(text=response.text)
+            except Exception as exc:
+                # Retry on transient errors (rate limits, server errors)
+                err_str = str(exc).lower()
+                if attempt < 2 and any(
+                    kw in err_str
+                    for kw in ["429", "500", "503", "rate", "quota", "overloaded"]
+                ):
+                    wait = 2 ** (attempt + 1)
+                    time.sleep(wait)
                     continue
                 raise
 
-    def is_available(self) -> bool:
-        """Check if Ollama is running and the model is pulled."""
+    def test_connection(self) -> bool:
+        """Quick test to verify the API key and model work."""
         try:
-            resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
-            if resp.status_code != 200:
-                return False
-            models = [m["name"] for m in resp.json().get("models", [])]
-            # Check if our model (possibly without tag) is available
-            return any(
-                self.model in m or m.startswith(self.model.split(":")[0])
-                for m in models
+            resp = self.chat(
+                system="Reply with exactly: OK",
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=10,
             )
+            return bool(resp.text.strip())
         except Exception:
             return False
 
-    def pull_model(self) -> None:
-        """Pull the model if not already available."""
-        print(f"  Pulling model {self.model} (this may take a while) ...")
-        resp = requests.post(
-            f"{self.base_url}/api/pull",
-            json={"name": self.model, "stream": False},
-            timeout=3600,
-        )
-        resp.raise_for_status()
-        print(f"  Model {self.model} ready.")
+    def list_models(self) -> list[str]:
+        """List available Gemini models."""
+        try:
+            return [
+                m.name for m in self.genai.list_models()
+                if "generateContent" in (m.supported_generation_methods or [])
+            ]
+        except Exception:
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -158,15 +146,15 @@ def get_backend() -> LLMBackend:
     """
     Create the appropriate LLM backend based on environment config.
 
-    LLM_BACKEND=ollama   → OllamaBackend
+    LLM_BACKEND=gemini    → GeminiBackend (Gemini 2.5 Flash-Lite)
     LLM_BACKEND=anthropic → AnthropicBackend (default)
     """
     backend_type = os.getenv("LLM_BACKEND", "anthropic").lower().strip()
 
-    if backend_type == "ollama":
-        model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
-        base_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-        return OllamaBackend(model=model, base_url=base_url)
+    if backend_type == "gemini":
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        api_key = os.getenv("GEMINI_API_KEY")
+        return GeminiBackend(model=model, api_key=api_key)
     else:
         model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
         api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -176,7 +164,7 @@ def get_backend() -> LLMBackend:
 def parse_json_response(raw: str) -> dict | list | None:
     """
     Extract JSON from an LLM response, handling code fences and stray text.
-    Works for both Claude (clean JSON) and Ollama models (often wrapped).
+    Works for both Claude (clean JSON) and Gemini (sometimes wrapped).
     """
     raw = raw.strip()
     # Strip markdown code fences
