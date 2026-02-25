@@ -208,7 +208,8 @@ EDGAR_CACHE_DIR = os.getenv("EDGAR_CACHE_DIR", ".cache/edgar")
 # ---------------------------------------------------------------------------
 
 # When to send the Monday morning digest (24h format)
-SCHEDULE_TIME = os.getenv("SCHEDULE_TIME", "08:00")
+# Default 07:00 — before US market open (09:30 ET)
+SCHEDULE_TIME = os.getenv("SCHEDULE_TIME", "07:00")
 SCHEDULE_DAY = os.getenv("SCHEDULE_DAY", "monday")
 
 # Email settings (for sending the weekly digest)
@@ -218,3 +219,15 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")  # Recipient address (your email)
+
+# ---------------------------------------------------------------------------
+# WhatsApp notifications (via Twilio)
+# ---------------------------------------------------------------------------
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "")  # e.g. "whatsapp:+14155238886"
+WHATSAPP_TO = os.getenv("WHATSAPP_TO", "")  # e.g. "whatsapp:+1XXXXXXXXXX"
+
+# Notification channel: "email", "whatsapp", or "both"
+NOTIFICATION_CHANNEL = os.getenv("NOTIFICATION_CHANNEL", "both")

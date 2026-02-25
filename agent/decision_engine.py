@@ -99,6 +99,7 @@ class DecisionEngine:
                     confidence=result.confidence,
                     importance=result.importance,
                     reasoning=result.reasoning,
+                    value_impact=result.value_impact,
                     governance_concerns=result.governance_concerns,
                     aligned_preferences=result.aligned_preferences,
                     conflicting_factors=result.conflicting_factors,

@@ -4,13 +4,13 @@ Click + Rich CLI for the governance agent.
 Commands:
   fetch        — pull DEF 14A filings from SEC EDGAR (US tickers)
   add          — manually enter ballot items (intl. companies)
-  analyze      — run AI analysis on pending proposals
+  analyze      — run AI analysis on pending proposals (value-maximizing)
   review       — interactive queue for items needing human decision
   report       — print voting report table
   preferences  — list | set | learn
   chat         — freeform Q&A about governance
-  digest       — run full pipeline once (fetch→analyze→email)
-  schedule     — run as daemon, auto-trigger every Monday morning
+  digest       — run full pipeline once (fetch→analyze→send digest via email/WhatsApp)
+  schedule     — run as daemon, auto-trigger every Monday before market open
   setup-gemini — verify Gemini API key and test the model
 """
 
@@ -288,6 +288,11 @@ def review() -> None:
                 f"{row['recommendation']}[/]"
             ),
             f"Confidence: {row['confidence']:.0%}  Importance: {row['importance']:.0%}",
+        ]
+        value_impact = row.get("value_impact") or ""
+        if value_impact:
+            panel_lines.append(f"\n[bold]Value impact:[/bold] {value_impact}")
+        panel_lines += [
             "",
             f"[bold]Reasoning:[/bold] {row['reasoning']}",
         ]
@@ -514,17 +519,41 @@ def chat() -> None:
 
 
 # ---------------------------------------------------------------------------
-# digest  (one-shot pipeline: fetch → analyze → email)
+# digest  (one-shot pipeline: fetch → analyze → send digest)
 # ---------------------------------------------------------------------------
 
 @click.command()
-def digest() -> None:
-    """Run the full pipeline once: fetch → analyze → send email digest."""
+@click.option(
+    "--channel", "-c",
+    type=click.Choice(["email", "whatsapp", "both"], case_sensitive=False),
+    default=None,
+    help="Notification channel (default: from NOTIFICATION_CHANNEL env)",
+)
+@click.option(
+    "--all-proposals", is_flag=True, default=False,
+    help="Include all proposals, not just this week's votes",
+)
+def digest(channel: str | None, all_proposals: bool) -> None:
+    """Run the full pipeline once: fetch → analyze → send digest (email + WhatsApp).
+
+    By default, filters to proposals with meetings this week and sends via
+    the configured notification channel (email, WhatsApp, or both).
+    """
     _ensure_db()
     _check_llm_backend()
 
     from scheduler import run_pipeline
-    run_pipeline(verbose=True)
+    import notifications
+
+    if channel:
+        # Temporarily override the notification channel for this run
+        original = notifications.NOTIFICATION_CHANNEL
+        notifications.NOTIFICATION_CHANNEL = channel
+
+    run_pipeline(verbose=True, week_only=not all_proposals)
+
+    if channel:
+        notifications.NOTIFICATION_CHANNEL = original
 
 
 # ---------------------------------------------------------------------------
@@ -533,15 +562,23 @@ def digest() -> None:
 
 @click.command("schedule")
 def schedule_daemon() -> None:
-    """Run as a daemon — triggers the pipeline every Monday morning."""
+    """Run as a daemon — triggers the pipeline every Monday before US market open.
+
+    The pipeline scans for corporate votes happening this week, analyzes them
+    to maximize shareholder value, and sends the digest via email and/or WhatsApp.
+    """
     _ensure_db()
 
     from scheduler import run_daemon, print_cron_instructions
 
     console.print(
         Panel(
-            "The scheduler will run the full pipeline (fetch → analyze → email) "
-            "automatically. Keep this process running in the background.\n\n"
+            "The scheduler will run the full pipeline every Monday before market open:\n"
+            "  1. Fetch proxy filings from SEC EDGAR\n"
+            "  2. Analyze proposals to maximize shareholder value\n"
+            "  3. Filter to this week's corporate votes\n"
+            "  4. Send digest via email and/or WhatsApp\n\n"
+            "Keep this process running in the background.\n"
             "Alternative: use a cron job instead (see below).",
             title="Governance Agent Scheduler",
             border_style="blue",

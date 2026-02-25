@@ -1,14 +1,17 @@
 """
-Scheduler — runs the governance pipeline automatically and sends a digest email.
+Scheduler — runs the governance pipeline automatically and sends a digest.
 
 Two modes:
-  1. `python main.py digest`      — run the pipeline once now and send email
+  1. `python main.py digest`      — run the pipeline once now and send digest
   2. `python main.py schedule`    — run as a daemon, trigger every Monday morning
 
-The pipeline:  fetch → analyze → email digest.
+The pipeline:  fetch → analyze → filter this-week votes → send digest (email + WhatsApp).
+
+The default schedule (Monday 07:00) ensures you receive voting recommendations
+BEFORE US equity markets open at 09:30 ET.
 
 For production use you can also set up a cron job instead of the daemon:
-  0 8 * * 1  cd /path/to/Government-agent && python main.py digest
+  0 7 * * 1  cd /path/to/Government-agent && python main.py digest
 """
 
 import time
@@ -27,15 +30,44 @@ from data.edgar import EDGARClient
 from agent.analyzer import ProposalAnalyzer
 from agent.decision_engine import DecisionEngine
 from data import storage
-from notifications import send_digest_email
+from notifications import send_digest_email, send_digest_whatsapp, send_digest
 
 
-def run_pipeline(verbose: bool = True) -> dict:
+def _get_this_week_range() -> tuple[str, str]:
+    """Return (monday_date, sunday_date) strings for the current week."""
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+
+
+def _filter_this_week_rows(rows: list) -> list:
+    """
+    Filter report rows to only include proposals with meetings during
+    the current week (Monday–Sunday).
+
+    If a proposal has no meeting_date set, include it anyway so it
+    doesn't get silently dropped.
+    """
+    mon, sun = _get_this_week_range()
+    filtered = []
+    for r in rows:
+        meeting = r["meeting_date"] or ""
+        if not meeting:
+            # No date — include (user may need to review)
+            filtered.append(r)
+        elif mon <= meeting <= sun:
+            filtered.append(r)
+    return filtered
+
+
+def run_pipeline(verbose: bool = True, week_only: bool = True) -> dict:
     """
     Execute the full governance pipeline:
       1. Fetch latest proxy filings from EDGAR for all US tickers
-      2. Analyze all pending proposals
-      3. Send the digest email
+      2. Analyze all pending proposals (value-maximizing recommendations)
+      3. Filter to this week's votes (if week_only=True)
+      4. Send digest via configured channels (email and/or WhatsApp)
 
     Returns a summary dict.
     """
@@ -48,6 +80,8 @@ def run_pipeline(verbose: bool = True) -> dict:
         "escalated": 0,
         "errors": [],
         "email_sent": False,
+        "whatsapp_sent": False,
+        "this_week_proposals": 0,
     }
 
     # ------------------------------------------------------------------
@@ -112,11 +146,11 @@ def run_pipeline(verbose: bool = True) -> dict:
                 )
 
     # ------------------------------------------------------------------
-    # Step 2: Analyze
+    # Step 2: Analyze (value-maximizing recommendations)
     # ------------------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
-        print("STEP 2: Analyzing pending proposals")
+        print("STEP 2: Analyzing pending proposals (maximizing shareholder value)")
         print("=" * 60)
 
     engine = DecisionEngine()
@@ -128,15 +162,29 @@ def run_pipeline(verbose: bool = True) -> dict:
     summary["errors"].extend(report.errors)
 
     # ------------------------------------------------------------------
-    # Step 3: Email digest
+    # Step 3: Filter to this week's votes & send digest
     # ------------------------------------------------------------------
     if verbose:
         print("\n" + "=" * 60)
-        print("STEP 3: Sending digest email")
+        print("STEP 3: Sending digest (email + WhatsApp)")
         print("=" * 60)
 
-    rows = storage.get_report_rows()
-    summary["email_sent"] = send_digest_email(rows=rows)
+    all_rows = storage.get_report_rows()
+
+    if week_only:
+        rows = _filter_this_week_rows(all_rows)
+        mon, sun = _get_this_week_range()
+        if verbose:
+            print(f"  Filtering to votes for this week ({mon} to {sun})")
+            print(f"  {len(rows)} proposal(s) for this week out of {len(all_rows)} total")
+    else:
+        rows = all_rows
+
+    summary["this_week_proposals"] = len(rows)
+
+    result = send_digest(rows=rows)
+    summary["email_sent"] = result["email_sent"]
+    summary["whatsapp_sent"] = result["whatsapp_sent"]
 
     # ------------------------------------------------------------------
     # Summary
@@ -149,8 +197,10 @@ def run_pipeline(verbose: bool = True) -> dict:
         print(f"  Analyzed: {summary['analyzed']}")
         print(f"  Auto-decided: {summary['auto_decided']}")
         print(f"  Needs review: {summary['escalated']}")
+        print(f"  This week's proposals: {summary['this_week_proposals']}")
         print(f"  Errors: {len(summary['errors'])}")
         print(f"  Email sent: {summary['email_sent']}")
+        print(f"  WhatsApp sent: {summary['whatsapp_sent']}")
         print("=" * 60)
 
     return summary
@@ -159,7 +209,7 @@ def run_pipeline(verbose: bool = True) -> dict:
 def run_daemon(verbose: bool = True) -> None:
     """
     Run as a long-lived daemon process. Triggers the pipeline on the configured
-    day and time (default: Monday 08:00).
+    day and time (default: Monday 07:00, before US market open at 09:30 ET).
 
     Blocking call — intended to be run via systemd, Docker, tmux, etc.
     """
@@ -178,8 +228,9 @@ def run_daemon(verbose: bool = True) -> None:
 
     print(
         f"Scheduler running. Pipeline will execute every "
-        f"{SCHEDULE_DAY.capitalize()} at {SCHEDULE_TIME}."
+        f"{SCHEDULE_DAY.capitalize()} at {SCHEDULE_TIME} (before US market open)."
     )
+    print("Digest will be sent via email and/or WhatsApp.")
     print("Press Ctrl-C to stop.\n")
 
     while True:
@@ -195,7 +246,7 @@ def print_cron_instructions() -> None:
     print(
         "To run the digest automatically via cron instead of the daemon:\n\n"
         "  crontab -e\n\n"
-        "Add this line (Monday 8:00 AM):\n\n"
-        f"  0 8 * * 1 cd {cwd} && {python} main.py digest >> /var/log/governance-agent.log 2>&1\n\n"
+        "Add this line (Monday 7:00 AM, before US market open):\n\n"
+        f"  0 7 * * 1 cd {cwd} && {python} main.py digest >> /var/log/governance-agent.log 2>&1\n\n"
         "Or for a different schedule, adjust the cron expression."
     )

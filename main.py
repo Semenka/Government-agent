@@ -1,6 +1,9 @@
 """
 Government Agent — Personal Shareholder Voting Assistant
 
+Maximizes shareholder value by analyzing corporate votes and sending
+weekly recommendations before US market open via email and WhatsApp.
+
 Usage:
   python main.py --help
   python main.py fetch [--ticker TSLA] [--months 18]
@@ -12,9 +15,9 @@ Usage:
   python main.py preferences set KEY VALUE
   python main.py preferences learn
   python main.py chat
-  python main.py digest                      # One-shot: fetch → analyze → email
-  python main.py schedule                    # Daemon: auto-run every Monday AM
-  python main.py setup-gemini [--model X]     # Verify Gemini API key + test
+  python main.py digest [--channel whatsapp]  # One-shot: fetch → analyze → send digest
+  python main.py schedule                     # Daemon: Monday pre-market digest
+  python main.py setup-gemini [--model X]      # Verify Gemini API key + test
 """
 
 import click

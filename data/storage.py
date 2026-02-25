@@ -39,7 +39,7 @@ def get_conn() -> Generator[sqlite3.Connection, None, None]:
 
 
 def init_db() -> None:
-    """Create tables if they don't exist yet."""
+    """Create tables if they don't exist yet, and run migrations."""
     with get_conn() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS proposals (
@@ -66,6 +66,7 @@ def init_db() -> None:
                 confidence          REAL NOT NULL,
                 importance          REAL NOT NULL,
                 reasoning           TEXT,
+                value_impact        TEXT,
                 governance_concerns TEXT,
                 aligned_preferences TEXT,
                 conflicting_factors TEXT,
@@ -92,6 +93,13 @@ def init_db() -> None:
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
+
+        # Migration: add value_impact column to existing databases
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()
+        ]
+        if "value_impact" not in columns:
+            conn.execute("ALTER TABLE decisions ADD COLUMN value_impact TEXT")
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +202,7 @@ def save_decision(
     confidence: float,
     importance: float,
     reasoning: str = "",
+    value_impact: str = "",
     governance_concerns: list | None = None,
     aligned_preferences: list | None = None,
     conflicting_factors: list | None = None,
@@ -203,15 +212,16 @@ def save_decision(
         cur = conn.execute(
             """INSERT OR REPLACE INTO decisions
                (proposal_id, recommendation, confidence, importance, reasoning,
-                governance_concerns, aligned_preferences, conflicting_factors,
-                needs_review, decided_at)
-               VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))""",
+                value_impact, governance_concerns, aligned_preferences,
+                conflicting_factors, needs_review, decided_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))""",
             (
                 proposal_id,
                 recommendation,
                 confidence,
                 importance,
                 reasoning,
+                value_impact,
                 json.dumps(governance_concerns or []),
                 json.dumps(aligned_preferences or []),
                 json.dumps(conflicting_factors or []),
@@ -225,7 +235,8 @@ def get_review_queue() -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
             """SELECT p.*, d.id as decision_id, d.recommendation, d.confidence,
-                      d.importance, d.reasoning, d.governance_concerns,
+                      d.importance, d.reasoning, d.value_impact,
+                      d.governance_concerns,
                       d.aligned_preferences, d.conflicting_factors
                FROM proposals p
                JOIN decisions d ON d.proposal_id = p.id
@@ -271,7 +282,7 @@ def get_report_rows(ticker: str | None = None, year: str | None = None) -> list[
                        p.management_rec, p.status,
                        d.recommendation, d.confidence, d.importance,
                        d.needs_review, d.user_override, d.user_note,
-                       d.reasoning
+                       d.reasoning, d.value_impact
                 FROM proposals p
                 LEFT JOIN decisions d ON d.proposal_id = p.id
                 {where}

@@ -24,6 +24,7 @@ class AnalysisResult:
     confidence: float            # 0.0 – 1.0
     importance: float            # 0.0 – 1.0
     reasoning: str
+    value_impact: str            # Expected financial impact for shareholders
     governance_concerns: list[str]
     aligned_preferences: list[str]
     conflicting_factors: list[str]
@@ -31,11 +32,19 @@ class AnalysisResult:
 
 
 SYSTEM_PROMPT = """You are an expert corporate governance analyst and proxy advisor.
-Your role is to evaluate shareholder ballot proposals and recommend how a long-term
-investor should vote, based on:
-  - Established corporate governance best practices (ISS, Glass Lewis principles)
-  - The investor's stated personal preferences (provided in each request)
-  - The long-term interests of shareholders
+Your primary objective is to MAXIMIZE SHAREHOLDER VALUE for a long-term investor.
+Every recommendation must be evaluated through the lens of:
+  1. Direct financial impact — will this proposal increase or decrease the share price,
+     dividends, buybacks, or long-term earnings?
+  2. Capital allocation efficiency — does this support optimal use of company resources?
+  3. Management accountability — does this align management incentives with shareholders?
+  4. Risk-adjusted returns — does this reduce downside risk or improve upside potential?
+  5. Established corporate governance best practices (ISS, Glass Lewis principles)
+  6. The investor's stated personal preferences (provided in each request)
+
+When management's recommendation conflicts with shareholder value maximization,
+always prioritize shareholder value. Be skeptical of proposals that entrench management,
+dilute ownership, or waste capital.
 
 You always output valid JSON — never wrap it in markdown code fences.
 You are direct, analytical, and concise.
@@ -60,7 +69,7 @@ PROXY TEXT:
 {text}
 """
 
-ANALYSIS_USER_TEMPLATE = """Analyze this shareholder ballot proposal and recommend a vote.
+ANALYSIS_USER_TEMPLATE = """Analyze this shareholder ballot proposal and recommend a vote that MAXIMIZES SHAREHOLDER VALUE.
 
 COMPANY: {company} ({ticker})
 MEETING DATE: {meeting_date}
@@ -74,14 +83,22 @@ MANAGEMENT RECOMMENDATION: {management_rec}
 USER'S GOVERNANCE PREFERENCES:
 {preferences_context}
 
-Evaluate this proposal against governance best practices AND the user's preferences above.
+Your analysis MUST consider:
+1. How will this proposal impact shareholder value (share price, dividends, earnings)?
+2. Does it improve or weaken capital allocation and management accountability?
+3. Does it entrench management, dilute existing shareholders, or destroy value?
+4. What is the risk/reward from a long-term shareholder perspective?
+
+Evaluate against governance best practices AND the user's preferences. Always choose the
+vote that best serves the shareholder's financial interest.
 
 Return a single JSON object with these exact keys (no code fences):
 {{
   "recommendation": "FOR" | "AGAINST" | "ABSTAIN",
   "confidence": <float 0.0-1.0 how certain you are this is the right vote>,
   "importance": <float 0.0-1.0 how consequential this vote is for the shareholder>,
-  "reasoning": "<2-4 sentence explanation>",
+  "reasoning": "<2-4 sentence explanation focused on shareholder value impact>",
+  "value_impact": "<1 sentence on expected financial impact for shareholders>",
   "governance_concerns": ["<specific concern 1>", ...],
   "aligned_preferences": ["<which user preference supports this recommendation>", ...],
   "conflicting_factors": ["<anything that creates uncertainty>", ...],
@@ -181,6 +198,7 @@ class ProposalAnalyzer:
                 confidence=0.0,
                 importance=0.5,
                 reasoning="Analysis failed — could not parse LLM response. Manual review required.",
+                value_impact="Unknown — parse error.",
                 governance_concerns=["Could not parse response"],
                 aligned_preferences=[],
                 conflicting_factors=["Parse error"],
@@ -195,6 +213,7 @@ class ProposalAnalyzer:
             confidence=confidence,
             importance=importance,
             reasoning=data.get("reasoning", ""),
+            value_impact=data.get("value_impact", ""),
             governance_concerns=data.get("governance_concerns", []),
             aligned_preferences=data.get("aligned_preferences", []),
             conflicting_factors=data.get("conflicting_factors", []),
