@@ -16,6 +16,3 @@ click>=8.1.0
 
 # Scheduler
 schedule>=1.2.0
-
-# WhatsApp notifications (via Twilio)
-twilio>=9.0.0

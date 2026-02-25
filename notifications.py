@@ -2,11 +2,11 @@
 Notification module — sends the weekly governance digest via email and/or WhatsApp.
 
 Email: SMTP (Gmail, Outlook, or any provider).
-WhatsApp: Twilio WhatsApp Business API.
+WhatsApp: OpenClaw local gateway (must be running with WhatsApp linked).
 
 Configure in .env:
   Email:    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
-  WhatsApp: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, WHATSAPP_TO
+  WhatsApp: OPENCLAW_GATEWAY_URL, OPENCLAW_GATEWAY_TOKEN, WHATSAPP_TO
   Channel:  NOTIFICATION_CHANNEL=email|whatsapp|both
 """
 
@@ -15,6 +15,8 @@ from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
+
 from config import (
     SMTP_HOST,
     SMTP_PORT,
@@ -22,9 +24,8 @@ from config import (
     SMTP_PASSWORD,
     EMAIL_FROM,
     EMAIL_TO,
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_WHATSAPP_FROM,
+    OPENCLAW_GATEWAY_URL,
+    OPENCLAW_GATEWAY_TOKEN,
     WHATSAPP_TO,
     NOTIFICATION_CHANNEL,
     PORTFOLIO,
@@ -189,17 +190,14 @@ def send_digest_email(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# WhatsApp digest (via Twilio)
+# WhatsApp digest (via OpenClaw local gateway)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_whatsapp_message(rows: list, week_label: str) -> str:
     """
     Build a concise plain-text digest suitable for WhatsApp.
-    WhatsApp messages have a 1600-char limit per message, so we keep it tight
-    and split into multiple messages if necessary.
+    Uses WhatsApp bold (*text*) and italic (_text_) formatting.
     """
-    vote_emoji = {"FOR": "FOR", "AGAINST": "AGAINST", "ABSTAIN": "ABSTAIN", "WITHHOLD": "ABSTAIN"}
-
     auto = [r for r in rows if not (r["needs_review"] and not r["user_override"])]
     review = [r for r in rows if r["needs_review"] and not r["user_override"]]
 
@@ -254,58 +252,67 @@ def _build_whatsapp_message(rows: list, week_label: str) -> str:
     return "\n".join(lines)
 
 
-def send_digest_whatsapp(
-    rows: list | None = None,
-    week_label: str | None = None,
-) -> bool:
+def _openclaw_send_whatsapp(phone: str, text: str) -> bool:
     """
-    Build and send the weekly governance digest via WhatsApp (Twilio).
-    Returns True if sent successfully, False otherwise.
+    Send a WhatsApp message through the local OpenClaw gateway.
+
+    Uses the /tools/invoke endpoint with the whatsapp_send tool.
+    Falls back to the /v1/chat/completions endpoint if the tool
+    is not available.
     """
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_FROM, WHATSAPP_TO]):
-        print(
-            "WhatsApp not configured — set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, "
-            "TWILIO_WHATSAPP_FROM, WHATSAPP_TO in .env"
-        )
-        return False
+    base = OPENCLAW_GATEWAY_URL.rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if OPENCLAW_GATEWAY_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_GATEWAY_TOKEN}"
 
-    if rows is None:
-        rows = storage.get_report_rows()
-
-    if week_label is None:
-        today = datetime.now()
-        monday = today - timedelta(days=today.weekday())
-        week_label = monday.strftime("%B %d, %Y")
-
-    body = _build_whatsapp_message(rows, week_label)
-
+    # Attempt 1: direct tool invocation
     try:
-        from twilio.rest import Client
+        resp = requests.post(
+            f"{base}/tools/invoke",
+            headers=headers,
+            json={
+                "tool": "whatsapp_send",
+                "action": "json",
+                "args": {"to": phone, "message": text},
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("ok"):
+                return True
+    except requests.RequestException:
+        pass
 
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    # Attempt 2: ask the agent to relay the message
+    try:
+        prompt = (
+            f"Send the following message to {phone} on WhatsApp exactly as written. "
+            f"Do not add commentary:\n\n{text}"
+        )
+        resp = requests.post(
+            f"{base}/v1/chat/completions",
+            headers={**headers, "x-openclaw-agent-id": "main"},
+            json={
+                "model": "openclaw",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        if resp.status_code == 200:
+            return True
+    except requests.RequestException:
+        pass
 
-        # Twilio WhatsApp has a ~1600 char limit per message.
-        # Split into chunks if needed.
-        chunks = _split_message(body, max_len=1500)
-        for chunk in chunks:
-            client.messages.create(
-                body=chunk,
-                from_=TWILIO_WHATSAPP_FROM,
-                to=WHATSAPP_TO,
-            )
-
-        print(f"Digest sent via WhatsApp to {WHATSAPP_TO}")
-        return True
-    except ImportError:
-        print("Twilio library not installed. Run: pip install twilio")
-        return False
-    except Exception as exc:
-        print(f"Failed to send WhatsApp message: {exc}")
-        return False
+    return False
 
 
-def _split_message(text: str, max_len: int = 1500) -> list[str]:
-    """Split a long message into chunks at line boundaries."""
+def _split_message(text: str, max_len: int = 3500) -> list[str]:
+    """Split a long message into chunks at line boundaries.
+
+    OpenClaw's WhatsApp channel supports up to textChunkLimit (default 4000)
+    chars per message, so we use a conservative 3500.
+    """
     if len(text) <= max_len:
         return [text]
 
@@ -321,6 +328,70 @@ def _split_message(text: str, max_len: int = 1500) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def send_digest_whatsapp(
+    rows: list | None = None,
+    week_label: str | None = None,
+) -> bool:
+    """
+    Build and send the weekly governance digest via WhatsApp (OpenClaw).
+    Requires OpenClaw gateway running locally with WhatsApp linked.
+    Returns True if sent successfully, False otherwise.
+    """
+    if not WHATSAPP_TO:
+        print(
+            "WhatsApp not configured — set WHATSAPP_TO in .env "
+            "(your phone number with country code, e.g. +15555550123)"
+        )
+        return False
+
+    if not OPENCLAW_GATEWAY_URL:
+        print(
+            "OpenClaw not configured — set OPENCLAW_GATEWAY_URL in .env "
+            "(default: http://127.0.0.1:18789)"
+        )
+        return False
+
+    # Quick health check — is the gateway reachable?
+    try:
+        resp = requests.get(
+            f"{OPENCLAW_GATEWAY_URL.rstrip('/')}/v1/chat/completions",
+            timeout=5,
+        )
+        # Any response (even 405 Method Not Allowed) means the gateway is up
+    except requests.ConnectionError:
+        print(
+            f"OpenClaw gateway not reachable at {OPENCLAW_GATEWAY_URL}. "
+            "Make sure OpenClaw is running (openclaw gateway)."
+        )
+        return False
+    except requests.RequestException:
+        pass  # Other errors are fine — gateway is responding
+
+    if rows is None:
+        rows = storage.get_report_rows()
+
+    if week_label is None:
+        today = datetime.now()
+        monday = today - timedelta(days=today.weekday())
+        week_label = monday.strftime("%B %d, %Y")
+
+    body = _build_whatsapp_message(rows, week_label)
+
+    # Split into chunks respecting OpenClaw's textChunkLimit
+    chunks = _split_message(body, max_len=3500)
+    all_sent = True
+
+    for chunk in chunks:
+        if not _openclaw_send_whatsapp(WHATSAPP_TO, chunk):
+            all_sent = False
+            print(f"Failed to send WhatsApp chunk via OpenClaw")
+            break
+
+    if all_sent:
+        print(f"Digest sent via WhatsApp to {WHATSAPP_TO} (OpenClaw)")
+    return all_sent
 
 
 # ──────────────────────────────────────────────────────────────────────────────
