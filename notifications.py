@@ -412,6 +412,10 @@ def send_digest(
 
     result = {"email_sent": False, "whatsapp_sent": False}
 
+    # "none" is used by OpenClaw skill scripts — they handle output via stdout
+    if ch == "none":
+        return result
+
     if ch in ("email", "both"):
         result["email_sent"] = send_digest_email(rows=rows, week_label=week_label)
 
