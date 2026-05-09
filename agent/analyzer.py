@@ -2,16 +2,24 @@
 LLM-powered proposal analysis.
 
 Uses the backend abstraction (agent.llm_backend) so it works with both
-Ollama (local) and Anthropic (cloud).
+Gemini (cloud) and Anthropic (cloud).
 
-Two main jobs:
-  1. extract_ballot_items() — parse raw proxy text into structured proposals
-  2. analyze()              — evaluate a proposal against user preferences
-                              and return a scored recommendation
+Three main jobs:
+  1. extract_ballot_items()    — parse raw proxy text into structured proposals
+  2. analyze()                 — single-pass evaluation against user preferences
+  3. analyze_with_critique()   — two-pass: analyze, then self-critique.
+                                  The second pass is fed the first pass's JSON
+                                  and asked to argue the strongest counter-case
+                                  before re-deciding.
+
+build_thematic_context() injects portfolio-wide framing (e.g. "you are voting
+on climate disclosure at 4 of 18 holdings this season") into prompts so the
+LLM can make recommendations that are coherent across the portfolio rather
+than evaluating proposals in isolation.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from config import ProposalType, VoteChoice
 from agent.llm_backend import LLMBackend, get_backend, parse_json_response
@@ -28,6 +36,21 @@ class AnalysisResult:
     aligned_preferences: list[str]
     conflicting_factors: list[str]
     proposal_type: str           # Detected / confirmed type
+    raw_json: str = ""           # Verbatim model output (for analysis_passes table)
+
+
+@dataclass
+class CritiqueResult:
+    """Output of the self-critique pass.
+
+    `revised` is True iff the second pass's recommendation differs from the
+    first pass's. The second pass becomes the stored decision regardless;
+    `revised` is recorded so the audit trail is honest about flips.
+    """
+    final: AnalysisResult
+    pass1: AnalysisResult
+    critique_text: str
+    revised: bool
 
 
 SYSTEM_PROMPT = """You are an expert corporate governance analyst and proxy advisor.
@@ -103,6 +126,55 @@ Return [] if no clear preferences can be extracted.
 """
 
 
+CRITIQUE_SYSTEM = """You are a skeptical second-opinion reviewer for proxy voting decisions.
+Your job is to argue the strongest counter-case to a colleague's draft recommendation,
+then decide whether the recommendation should stand or be revised.
+
+You always output valid JSON — never wrap it in markdown code fences.
+You are direct, analytical, and willing to disagree.
+"""
+
+
+CRITIQUE_USER_TEMPLATE = """A colleague produced this draft analysis of a shareholder ballot:
+
+DRAFT ANALYSIS (JSON):
+{pass1_json}
+
+PROPOSAL CONTEXT:
+COMPANY: {company} ({ticker})
+PROPOSAL #{proposal_number}: {title}
+MANAGEMENT RECOMMENDATION: {management_rec}
+
+USER'S GOVERNANCE PREFERENCES:
+{preferences_context}
+
+PORTFOLIO-WIDE THEMATIC CONTEXT:
+{thematic_context}
+
+Now do three things:
+1. Argue the SINGLE STRONGEST counter-case — what is the best reason the recommendation
+   could be wrong? Cite specific governance principles or user preferences in conflict.
+2. Decide whether the draft recommendation should stand or be revised.
+3. Re-issue the analysis JSON (same schema as the draft) reflecting your final view.
+
+Return a single JSON object with these keys (no code fences):
+{{
+  "critique": "<2-4 sentence counter-argument>",
+  "should_revise": <true|false>,
+  "final": {{
+    "recommendation": "FOR" | "AGAINST" | "ABSTAIN",
+    "confidence": <float 0.0-1.0>,
+    "importance": <float 0.0-1.0>,
+    "reasoning": "<2-4 sentence explanation, integrating the critique>",
+    "governance_concerns": ["..."],
+    "aligned_preferences": ["..."],
+    "conflicting_factors": ["..."],
+    "proposal_type": "<same enum as before>"
+  }}
+}}
+"""
+
+
 class ProposalAnalyzer:
     def __init__(self, backend: LLMBackend | None = None) -> None:
         self.backend = backend or get_backend()
@@ -174,7 +246,79 @@ class ProposalAnalyzer:
             messages=[{"role": "user", "content": prompt}],
         )
 
+        return self._parse_analysis(response.text)
+
+    def analyze_with_critique(
+        self,
+        ticker: str,
+        company_name: str,
+        proposal_number: str,
+        title: str,
+        full_text: str,
+        management_rec: str,
+        meeting_date: str,
+        preferences_context: str,
+        thematic_context: str = "",
+    ) -> CritiqueResult:
+        """
+        Two-pass analysis: produce a draft, then a skeptical critique that
+        either confirms or revises it. The second pass becomes the final
+        decision; both passes are returned so callers can persist the trail.
+        """
+        pass1 = self.analyze(
+            ticker=ticker,
+            company_name=company_name,
+            proposal_number=proposal_number,
+            title=title,
+            full_text=full_text,
+            management_rec=management_rec,
+            meeting_date=meeting_date,
+            preferences_context=preferences_context,
+        )
+
+        critique_prompt = CRITIQUE_USER_TEMPLATE.format(
+            pass1_json=pass1.raw_json or json.dumps(self._result_to_dict(pass1)),
+            company=company_name,
+            ticker=ticker,
+            proposal_number=proposal_number,
+            title=title,
+            management_rec=management_rec or "not stated",
+            preferences_context=preferences_context,
+            thematic_context=thematic_context or "(no related portfolio context)",
+        )
+
+        response = self.backend.chat(
+            system=CRITIQUE_SYSTEM,
+            messages=[{"role": "user", "content": critique_prompt}],
+        )
+
         data = parse_json_response(response.text)
+        if not isinstance(data, dict) or "final" not in data:
+            # Critique pass failed — fall back to pass1, but record the failure
+            return CritiqueResult(
+                final=pass1,
+                pass1=pass1,
+                critique_text="(critique pass failed to return valid JSON — using pass-1 result)",
+                revised=False,
+            )
+
+        final = self._parse_analysis_dict(data.get("final", {}), raw_json=response.text)
+        critique_text = str(data.get("critique", ""))[:2000]
+        revised = (final.recommendation or "").upper() != (pass1.recommendation or "").upper()
+
+        return CritiqueResult(
+            final=final,
+            pass1=pass1,
+            critique_text=critique_text,
+            revised=revised,
+        )
+
+    # ------------------------------------------------------------------
+    # Parsing helpers
+    # ------------------------------------------------------------------
+
+    def _parse_analysis(self, raw_text: str) -> AnalysisResult:
+        data = parse_json_response(raw_text)
         if not isinstance(data, dict):
             return AnalysisResult(
                 recommendation=VoteChoice.ABSTAIN.value,
@@ -185,21 +329,37 @@ class ProposalAnalyzer:
                 aligned_preferences=[],
                 conflicting_factors=["Parse error"],
                 proposal_type=ProposalType.OTHER.value,
+                raw_json=raw_text,
             )
+        return self._parse_analysis_dict(data, raw_json=raw_text)
 
+    def _parse_analysis_dict(self, data: dict, raw_json: str = "") -> AnalysisResult:
         confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
         importance = max(0.0, min(1.0, float(data.get("importance", 0.5))))
-
         return AnalysisResult(
-            recommendation=data.get("recommendation", VoteChoice.ABSTAIN.value),
+            recommendation=str(data.get("recommendation", VoteChoice.ABSTAIN.value)).upper(),
             confidence=confidence,
             importance=importance,
             reasoning=data.get("reasoning", ""),
-            governance_concerns=data.get("governance_concerns", []),
-            aligned_preferences=data.get("aligned_preferences", []),
-            conflicting_factors=data.get("conflicting_factors", []),
+            governance_concerns=list(data.get("governance_concerns", []) or []),
+            aligned_preferences=list(data.get("aligned_preferences", []) or []),
+            conflicting_factors=list(data.get("conflicting_factors", []) or []),
             proposal_type=data.get("proposal_type", ProposalType.OTHER.value),
+            raw_json=raw_json,
         )
+
+    @staticmethod
+    def _result_to_dict(result: AnalysisResult) -> dict:
+        return {
+            "recommendation": result.recommendation,
+            "confidence": result.confidence,
+            "importance": result.importance,
+            "reasoning": result.reasoning,
+            "governance_concerns": result.governance_concerns,
+            "aligned_preferences": result.aligned_preferences,
+            "conflicting_factors": result.conflicting_factors,
+            "proposal_type": result.proposal_type,
+        }
 
     # ------------------------------------------------------------------
     # Preference learning from natural-language statements
@@ -253,3 +413,56 @@ class ProposalAnalyzer:
             max_tokens=1024,
         )
         return response.text
+
+
+# ---------------------------------------------------------------------------
+# Thematic context — portfolio-wide framing for the critique pass
+# ---------------------------------------------------------------------------
+
+def build_thematic_context(
+    ticker: str,
+    proposal_type: str,
+    proposal_id: int | None = None,
+) -> str:
+    """
+    Return a short markdown summary of related proposals across the portfolio,
+    so the critique pass can spot patterns ("you're voting climate disclosure
+    at 4 of your 18 holdings this season") instead of judging in isolation.
+
+    Imported lazily to keep agent.analyzer import-light for callers that don't
+    need this (the storage import would otherwise create a soft cycle).
+    """
+    from data import storage
+
+    lines: list[str] = []
+
+    portfolio_pending = storage.get_pending_by_type_across_portfolio(
+        proposal_type, exclude_proposal_id=proposal_id,
+    )
+    if portfolio_pending:
+        lines.append(
+            f"- {len(portfolio_pending)} other holding(s) have pending "
+            f"`{proposal_type}` proposals this season:"
+        )
+        for r in portfolio_pending[:8]:
+            lines.append(
+                f"  • {r['ticker']} — {r['title'][:60]} "
+                f"(meeting {r['meeting_date'] or 'unknown'})"
+            )
+
+    history = storage.get_proposals_by_ticker_type(
+        ticker, proposal_type, exclude_proposal_id=proposal_id,
+    )
+    if history:
+        lines.append(
+            f"- Past `{proposal_type}` votes at {ticker.upper()}:"
+        )
+        for r in history:
+            final = r["user_override"] or r["recommendation"] or "—"
+            lines.append(
+                f"  • {r['meeting_date'] or '?'}: {r['title'][:50]} → {final}"
+            )
+
+    if not lines:
+        return "(no related proposals found in portfolio history)"
+    return "\n".join(lines)

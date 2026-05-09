@@ -16,3 +16,6 @@ click>=8.1.0
 
 # Scheduler
 schedule>=1.2.0
+
+# Telegram bot (long-polling worker)
+python-telegram-bot>=21.0

@@ -5,13 +5,15 @@ Optimizations over v1:
   - Disk-based response caching (avoids re-downloading proxy statements)
   - Retry with exponential backoff for network errors
   - Connection pooling via requests.Session
+  - Meeting-date / vote-deadline / meeting-URL extraction from proxy cover pages
 """
 
 import hashlib
 import os
+import re
 import time
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
@@ -41,6 +43,20 @@ class RawProposal:
     title: str
     description: str
     management_recommendation: str
+
+
+@dataclass
+class MeetingMetadata:
+    meeting_date: str = ""        # ISO YYYY-MM-DD
+    vote_deadline: str = ""       # ISO YYYY-MM-DD (typically meeting_date - 1 business day if not stated)
+    meeting_url: str = ""         # URL to meeting/notice page if present in filing
+
+
+@dataclass
+class FetchedDocument:
+    text: str
+    truncated: bool = False
+    raw_length: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -206,27 +222,41 @@ class EDGARClient:
             )
         return None
 
-    def download_document_text(self, url: str) -> str:
-        """Download an HTML proxy statement, cache it, return cleaned text."""
+    def download_document(self, url: str) -> FetchedDocument:
+        """
+        Download an HTML proxy statement, cache it, and return the cleaned text
+        along with a flag indicating whether the configured cap truncated it.
+
+        The cache stores the raw cleaned text (untruncated) keyed by URL hash.
+        Truncation happens at read time so that bumping EDGAR_HTML_MAX_CHARS
+        in config doesn't require purging the cache.
+        """
         cached = _read_cache(url)
-        if cached:
-            return cached
+        if cached is not None:
+            text = cached
+        else:
+            headers = {
+                "User-Agent": EDGAR_USER_AGENT,
+                "Accept-Encoding": "gzip, deflate",
+            }
+            resp = requests.get(url, headers=headers, timeout=60)
+            resp.raise_for_status()
 
-        headers = {
-            "User-Agent": EDGAR_USER_AGENT,
-            "Accept-Encoding": "gzip, deflate",
-        }
-        resp = requests.get(url, headers=headers, timeout=60)
-        resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            for tag in soup(["script", "style", "head"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+            _write_cache(url, text)
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        for tag in soup(["script", "style", "head"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        text = text[:EDGAR_HTML_MAX_CHARS]
+        raw_length = len(text)
+        truncated = raw_length > EDGAR_HTML_MAX_CHARS
+        if truncated:
+            text = text[:EDGAR_HTML_MAX_CHARS]
+        return FetchedDocument(text=text, truncated=truncated, raw_length=raw_length)
 
-        _write_cache(url, text)
-        return text
+    def download_document_text(self, url: str) -> str:
+        """Backwards-compatible string-only fetch. Prefer download_document()."""
+        return self.download_document(url).text
 
     # ------------------------------------------------------------------
     # Proposal extraction (delegates to the analyzer)
@@ -240,3 +270,130 @@ class EDGARClient:
     ) -> list[RawProposal]:
         """Use the LLM to pull ballot items out of raw proxy text."""
         return analyzer.extract_ballot_items(text, ticker)
+
+
+# ---------------------------------------------------------------------------
+# Meeting metadata extraction (regex-first, LLM fallback)
+# ---------------------------------------------------------------------------
+
+_MONTH = (
+    r"January|February|March|April|May|June|July|August|"
+    r"September|October|November|December"
+)
+
+# Allow "annual general meeting", "annual shareholders meeting", "annual meeting
+# of stockholders", etc. — any words may sit between "annual"/"special" and
+# the literal "meeting".
+_MEETING_PHRASE = r"(?:annual|special)\s+(?:[\w\-]+\s+){0,3}meeting"
+_HELD_PHRASE = r"(?:will\s+be\s+held|to\s+be\s+held|is\s+to\s+be\s+held|held|convened)\s+(?:on\s+)?"
+
+# Order matters: more-specific patterns first so we don't match a record-date
+# or filing-date string by accident.
+_MEETING_DATE_PATTERNS = [
+    # "Annual Meeting … will be held on May 23, 2026"
+    re.compile(
+        rf"{_MEETING_PHRASE}[^\n]{{0,200}}?{_HELD_PHRASE}"
+        rf"((?:{_MONTH})\s+\d{{1,2}},?\s+\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # "Meeting date: May 23, 2026" / "Date of the meeting: ..."
+    re.compile(
+        rf"(?:meeting\s+date|date\s+of\s+(?:the\s+)?meeting)\s*[:\-]?\s*"
+        rf"((?:{_MONTH})\s+\d{{1,2}},?\s+\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # European/UK form: "… will be held on 23 May 2026"
+    re.compile(
+        rf"{_MEETING_PHRASE}[^\n]{{0,200}}?{_HELD_PHRASE}"
+        rf"(\d{{1,2}}\s+(?:{_MONTH})\s+\d{{4}})",
+        re.IGNORECASE,
+    ),
+    # Numeric form: "… will be held on 5/23/2026"
+    re.compile(
+        rf"{_MEETING_PHRASE}[^\n]{{0,200}}?{_HELD_PHRASE}"
+        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+        re.IGNORECASE,
+    ),
+]
+
+_RECORD_DATE_PATTERN = re.compile(
+    r"record\s+date[^.\n]{0,40}?"
+    r"((?:January|February|March|April|May|June|July|August|"
+    r"September|October|November|December)\s+\d{1,2},?\s+\d{4}"
+    r"|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+    re.IGNORECASE,
+)
+
+_VOTE_DEADLINE_PATTERN = re.compile(
+    rf"(?:proxy|proxies|vote|votes|ballot|ballots)\s+"
+    r"(?:must\s+be\s+received|must\s+arrive|"
+    r"received\s+by|are\s+due\s+by|due\s+by|deadline|cutoff)"
+    rf"[^\n]{{0,120}}?"
+    rf"((?:{_MONTH})\s+\d{{1,2}},?\s+\d{{4}}"
+    r"|\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}"
+    rf"|\d{{1,2}}\s+(?:{_MONTH})\s+\d{{4}})",
+    re.IGNORECASE,
+)
+
+_MEETING_URL_PATTERN = re.compile(
+    r"https?://[^\s<>\"']*(?:proxyvote|proxydocs|annualmeeting|"
+    r"investor[^\s]*meeting|meeting[^\s]*notice|annual-meeting)"
+    r"[^\s<>\"']*",
+    re.IGNORECASE,
+)
+
+_DATE_FORMATS = [
+    "%B %d, %Y", "%B %d %Y", "%d %B %Y",
+    "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%m-%d-%y",
+    "%Y-%m-%d",
+]
+
+
+def _normalize_date(raw: str) -> str:
+    """Parse a date string in any of the formats above into ISO YYYY-MM-DD.
+    Returns "" if parsing fails."""
+    cleaned = raw.strip().rstrip(".,").replace(",", "")
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def extract_meeting_metadata(text: str) -> MeetingMetadata:
+    """
+    Pull meeting_date, vote_deadline, and meeting_url out of proxy text.
+
+    Regex-first because cover-page phrasing is highly conventional. Callers can
+    fall back to an LLM for fuzzy filings that don't match — see analyzer's
+    extract_ballot_items prompt, which can be extended to ask for these fields too.
+    """
+    md = MeetingMetadata()
+
+    head = text[:8000]  # Cover page + early body — enough for almost all proxies
+
+    for pat in _MEETING_DATE_PATTERNS:
+        m = pat.search(head)
+        if m:
+            iso = _normalize_date(m.group(1))
+            if iso:
+                md.meeting_date = iso
+                break
+
+    m = _VOTE_DEADLINE_PATTERN.search(head)
+    if m:
+        iso = _normalize_date(m.group(1))
+        if iso:
+            md.vote_deadline = iso
+
+    m = _MEETING_URL_PATTERN.search(text)
+    if m:
+        md.meeting_url = m.group(0).rstrip(".,;:")
+
+    # Default vote_deadline to meeting_date if we know the meeting date
+    # but no explicit cutoff was found. Better to alert too early than too late.
+    if md.meeting_date and not md.vote_deadline:
+        md.vote_deadline = md.meeting_date
+
+    return md

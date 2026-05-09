@@ -1,8 +1,14 @@
 """
-LLM backend abstraction — supports Gemini (Google) and Anthropic (Claude).
+LLM backend abstraction — supports four backends:
 
-Set LLM_BACKEND="gemini" in .env to use Gemini 2.5 Flash-Lite.
-Set LLM_BACKEND="anthropic" (default) to use Claude API.
+  - "gemini"     Gemini 2.5 Flash-Lite via Google AI API
+  - "anthropic"  Claude API
+  - "local"      Local LLM speaking the OpenAI-compatible /v1/chat/completions
+                 protocol (LM Studio, llama-server, vLLM, gbrain, etc.).
+                 Configure with LOCAL_LLM_URL and LOCAL_LLM_MODEL.
+  - "ollama"     Ollama's native /api/chat protocol
+
+Set LLM_BACKEND in .env to pick the active backend.
 """
 
 import json
@@ -139,26 +145,173 @@ class GeminiBackend(LLMBackend):
 
 
 # ---------------------------------------------------------------------------
+# Local LLM — OpenAI-compatible /v1/chat/completions
+# ---------------------------------------------------------------------------
+
+class LocalLLMBackend(LLMBackend):
+    """
+    Talk to a locally-installed LLM that speaks the OpenAI Chat Completions
+    protocol. Works with: LM Studio, llama-server (llama.cpp), vLLM, Jan,
+    LocalAI, Ollama's OpenAI-compat endpoint, and any tool that exposes the
+    same `/v1/chat/completions` shape — including `gbrain`.
+
+    Required env:
+      LOCAL_LLM_URL    Base URL, e.g. http://127.0.0.1:1234/v1   (LM Studio)
+                                       http://127.0.0.1:11434/v1 (Ollama OpenAI-compat)
+                                       http://127.0.0.1:8080/v1  (llama-server)
+      LOCAL_LLM_MODEL  Model identifier the server expects (e.g. "llama3.1:8b",
+                       "mistral-7b", or whatever your local model is called).
+
+    Optional:
+      LOCAL_LLM_API_KEY  Bearer token if the local server requires one.
+    """
+
+    def __init__(
+        self,
+        url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.base_url = (url or os.getenv("LOCAL_LLM_URL", "http://127.0.0.1:1234/v1")).rstrip("/")
+        self.model = model or os.getenv("LOCAL_LLM_MODEL", "local-model")
+        self.api_key = api_key or os.getenv("LOCAL_LLM_API_KEY", "")
+
+    def chat(self, system: str, messages: list[dict], max_tokens: int = 2048) -> LLMResponse:
+        payload_messages = [{"role": "system", "content": system}] + [
+            {"role": m["role"], "content": m["content"]} for m in messages
+        ]
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": self.model,
+                        "messages": payload_messages,
+                        "max_tokens": max_tokens,
+                        "temperature": 0.3,
+                        "stream": False,
+                    },
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                text = data["choices"][0]["message"]["content"]
+                return LLMResponse(text=text)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise
+            except requests.HTTPError as exc:
+                # Some servers return 5xx briefly on warm-up
+                if resp.status_code in (500, 502, 503, 504) and attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise
+
+    def test_connection(self) -> bool:
+        try:
+            resp = self.chat(
+                system="Reply with exactly: OK",
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=10,
+            )
+            return bool(resp.text.strip())
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Ollama — native /api/chat protocol
+# ---------------------------------------------------------------------------
+
+class OllamaBackend(LLMBackend):
+    """
+    Ollama's native chat endpoint. Use this if your local Ollama is not
+    running with the OpenAI-compat shim. Otherwise prefer LocalLLMBackend
+    pointed at http://127.0.0.1:11434/v1.
+
+    Required env:
+      OLLAMA_URL    Default http://127.0.0.1:11434
+      OLLAMA_MODEL  e.g. "llama3.1:8b"
+    """
+
+    def __init__(self, url: str | None = None, model: str | None = None) -> None:
+        self.base_url = (url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
+        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+    def chat(self, system: str, messages: list[dict], max_tokens: int = 2048) -> LLMResponse:
+        payload_messages = [{"role": "system", "content": system}] + [
+            {"role": m["role"], "content": m["content"]} for m in messages
+        ]
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "messages": payload_messages,
+                        "stream": False,
+                        "options": {
+                            "num_predict": max_tokens,
+                            "temperature": 0.3,
+                        },
+                    },
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return LLMResponse(text=data["message"]["content"])
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))
+                    continue
+                raise
+
+    def test_connection(self) -> bool:
+        try:
+            resp = self.chat(
+                system="Reply with exactly: OK",
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=10,
+            )
+            return bool(resp.text.strip())
+        except Exception:
+            return False
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def get_backend() -> LLMBackend:
     """
-    Create the appropriate LLM backend based on environment config.
+    Create the LLM backend chosen by LLM_BACKEND (case-insensitive).
 
-    LLM_BACKEND=gemini    → GeminiBackend (Gemini 2.5 Flash-Lite)
-    LLM_BACKEND=anthropic → AnthropicBackend (default)
+      LLM_BACKEND=local      LocalLLMBackend (OpenAI-compat HTTP — gbrain, LM Studio, ...)
+      LLM_BACKEND=ollama     OllamaBackend (native /api/chat)
+      LLM_BACKEND=gemini     GeminiBackend (Gemini 2.5 Flash-Lite)
+      LLM_BACKEND=anthropic  AnthropicBackend
     """
     backend_type = os.getenv("LLM_BACKEND", "anthropic").lower().strip()
 
+    if backend_type == "local":
+        return LocalLLMBackend()
+    if backend_type == "ollama":
+        return OllamaBackend()
     if backend_type == "gemini":
         model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
         api_key = os.getenv("GEMINI_API_KEY")
         return GeminiBackend(model=model, api_key=api_key)
-    else:
-        model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        return AnthropicBackend(model=model, api_key=api_key)
+
+    model = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    return AnthropicBackend(model=model, api_key=api_key)
 
 
 def parse_json_response(raw: str) -> dict | list | None:

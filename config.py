@@ -174,7 +174,7 @@ EXEC_COMP_IMPORTANCE_ESCALATE = 0.80
 # LLM backend config
 # ---------------------------------------------------------------------------
 
-# "anthropic" or "gemini"
+# "anthropic" | "gemini" | "local" | "ollama"
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")
 
 # Anthropic
@@ -185,13 +185,24 @@ CLAUDE_MAX_TOKENS = 2048
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# Local LLM (OpenAI-compatible /v1/chat/completions — gbrain, LM Studio,
+# llama-server, vLLM, Jan, LocalAI, Ollama's OpenAI-compat shim, …)
+LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "")
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "")
+
+# Ollama (native /api/chat)
+OLLAMA_URL = os.getenv("OLLAMA_URL", "")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "")
+
 
 # ---------------------------------------------------------------------------
 # EDGAR config
 # ---------------------------------------------------------------------------
 
-# Max characters of proxy HTML to pass to LLM for extraction
-EDGAR_HTML_MAX_CHARS = 60_000
+# Max characters of proxy HTML to pass to LLM for extraction.
+# Bumped from 60k to 120k so we don't silently drop the tail of long proxies.
+EDGAR_HTML_MAX_CHARS = int(os.getenv("EDGAR_HTML_MAX_CHARS", "120000"))
 
 # SEC EDGAR User-Agent (required by SEC policy — change to your contact info)
 EDGAR_USER_AGENT = os.getenv(
@@ -204,17 +215,34 @@ EDGAR_CACHE_DIR = os.getenv("EDGAR_CACHE_DIR", ".cache/edgar")
 
 
 # ---------------------------------------------------------------------------
-# Scheduler + email config
+# Scheduler + notifier config
 # ---------------------------------------------------------------------------
 
-# When to send the Monday morning digest (24h format)
+# Weekly digest time (24h format)
 SCHEDULE_TIME = os.getenv("SCHEDULE_TIME", "08:00")
 SCHEDULE_DAY = os.getenv("SCHEDULE_DAY", "monday")
 
-# Email settings (for sending the weekly digest)
+# Daily meeting-aware fan-out time
+MEETING_CHECK_TIME = os.getenv("MEETING_CHECK_TIME", "07:00")
+
+# Days-out tiers for pre-meeting alerts. Each (proposal, tier, channel)
+# combination fires exactly once via the meeting_alerts dedupe table.
+ALERT_TIERS = [
+    int(x) for x in os.getenv("ALERT_TIERS", "14,7,3,1").split(",") if x.strip()
+]
+
+# Comma-separated active notifier channels: "telegram,email" or "telegram"
+# Empty falls back to telegram if a bot token is configured, else email.
+NOTIFIER_CHANNELS = os.getenv("NOTIFIER_CHANNELS", "")
+
+# Telegram bot
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Email (SMTP)
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "")
-EMAIL_TO = os.getenv("EMAIL_TO", "")  # Recipient address (your email)
+EMAIL_TO = os.getenv("EMAIL_TO", "")

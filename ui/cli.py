@@ -44,25 +44,39 @@ def _ensure_db() -> None:
 
 
 def _check_llm_backend() -> None:
-    """Verify the configured LLM backend is reachable."""
+    """Verify the configured LLM backend has the credentials it needs."""
     backend_type = os.getenv("LLM_BACKEND", "anthropic").lower()
     if backend_type == "anthropic":
-        key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not key:
+        if not os.getenv("ANTHROPIC_API_KEY", ""):
             console.print(
                 "[bold red]Error:[/bold red] ANTHROPIC_API_KEY not set. "
-                "Copy .env.example to .env and add your key, or switch to Ollama."
+                "Copy .env.example to .env and add your key, or switch backends."
             )
             sys.exit(1)
     elif backend_type == "gemini":
-        key = os.getenv("GEMINI_API_KEY", "")
-        if not key:
+        if not os.getenv("GEMINI_API_KEY", ""):
             console.print(
                 "[bold red]Error:[/bold red] GEMINI_API_KEY not set. "
                 "Get one at https://aistudio.google.com/apikey\n"
                 "Run [bold]python main.py setup-gemini[/bold] for help."
             )
             sys.exit(1)
+    elif backend_type == "local":
+        if not os.getenv("LOCAL_LLM_URL", ""):
+            console.print(
+                "[bold red]Error:[/bold red] LOCAL_LLM_URL not set. "
+                "Point it at your local LLM server, e.g.\n"
+                "  LOCAL_LLM_URL=http://127.0.0.1:1234/v1\n"
+                "  LOCAL_LLM_MODEL=your-model-name\n"
+                "Run [bold]python main.py setup-local[/bold] to verify the connection."
+            )
+            sys.exit(1)
+    elif backend_type == "ollama":
+        if not os.getenv("OLLAMA_URL", "") and not os.getenv("OLLAMA_MODEL", ""):
+            console.print(
+                "[yellow]Warning:[/yellow] OLLAMA_URL/OLLAMA_MODEL not set — "
+                "using defaults http://127.0.0.1:11434 and llama3.1:8b."
+            )
 
 
 def _vote_cell(vote: str | None) -> Text:
@@ -556,6 +570,209 @@ def schedule_daemon() -> None:
 # ---------------------------------------------------------------------------
 # setup-gemini
 # ---------------------------------------------------------------------------
+
+@click.command("meeting-check")
+@click.option("--dry-run", is_flag=True, help="Show what would fire without calling LLMs or notifiers")
+@click.option("--tier", default=None, help="Restrict to one tier (e.g. T-7)")
+def meeting_check(dry_run: bool, tier: str | None) -> None:
+    """Fan out tier-based alerts (T-14/T-7/T-3/T-1) for upcoming meetings."""
+    _ensure_db()
+    if not dry_run:
+        _check_llm_backend()
+
+    from scheduler import run_meeting_check
+    summary = run_meeting_check(verbose=True, dry_run=dry_run, only_tier=tier)
+    if summary["errors"]:
+        console.print(f"[red]{len(summary['errors'])} error(s) during meeting-check.[/red]")
+
+
+@click.command("telegram-bot")
+def telegram_bot_cmd() -> None:
+    """Run the Telegram bot worker (long-polling). Blocks forever."""
+    if not os.getenv("TELEGRAM_BOT_TOKEN"):
+        console.print(
+            "[bold red]TELEGRAM_BOT_TOKEN not set.[/bold red]\n"
+            "1. Create a bot via @BotFather and copy the token\n"
+            "2. Add to .env:\n"
+            "     TELEGRAM_BOT_TOKEN=...\n"
+            "     TELEGRAM_CHAT_ID=...\n"
+            "3. Send any message to your bot, then visit\n"
+            "   https://api.telegram.org/bot<TOKEN>/getUpdates\n"
+            "   and copy chat.id."
+        )
+        sys.exit(1)
+    _ensure_db()
+
+    from telegram_bot import run as run_bot
+    run_bot()
+
+
+@click.command("backfill-meeting-dates")
+@click.option("--ticker", "-t", default=None, help="Backfill only this ticker")
+def backfill_meeting_dates(ticker: str | None) -> None:
+    """Re-parse cached EDGAR proxies to populate meeting_date / vote_deadline / meeting_url."""
+    _ensure_db()
+
+    from data.edgar import EDGARClient, extract_meeting_metadata
+    from data.storage import update_proposal_meeting_metadata, get_all_proposals
+
+    client = EDGARClient()
+    rows = get_all_proposals(ticker=ticker)
+    if not rows:
+        console.print("[yellow]No proposals to backfill.[/yellow]")
+        return
+
+    # Group by accession_number so we only re-download each filing once
+    by_filing: dict[tuple[str, str], list] = {}
+    for r in rows:
+        if not r["accession_number"]:
+            continue
+        by_filing.setdefault((r["ticker"], r["accession_number"]), []).append(r)
+
+    from config import PORTFOLIO
+    updated = 0
+    for (t, accession), proposal_rows in by_filing.items():
+        # Reconstruct the filing index URL
+        company = PORTFOLIO.get(t, {})
+        cik = company.get("cik")
+        if not cik:
+            continue
+        cik_int = int(cik)
+        accession_clean = accession.replace("-", "")
+
+        # Look at every cached HTML doc for this filing
+        from pathlib import Path
+        from config import EDGAR_CACHE_DIR
+        cache_dir = Path(EDGAR_CACHE_DIR)
+        if not cache_dir.exists():
+            continue
+
+        # We don't know the URL hash, so iterate cache files referenced by this filing.
+        # Heuristic: find filing index, get the doc URL, then read its cache.
+        try:
+            from data.edgar import Filing
+            filing = Filing(
+                accession_number=accession,
+                filing_date=proposal_rows[0]["filing_date"] or "",
+                form_type="DEF 14A",
+                primary_document="",
+                cik=str(cik_int),
+            )
+            url = client.get_filing_document_url(filing)
+            if not url:
+                continue
+            doc = client.download_document(url)
+            md = extract_meeting_metadata(doc.text)
+            if not md.meeting_date:
+                continue
+            for r in proposal_rows:
+                update_proposal_meeting_metadata(
+                    proposal_id=r["id"],
+                    meeting_date=md.meeting_date,
+                    vote_deadline=md.vote_deadline,
+                    meeting_url=md.meeting_url,
+                )
+                updated += 1
+            console.print(
+                f"  [green]{t}[/green] {accession} → meeting {md.meeting_date}"
+                f"{', deadline ' + md.vote_deadline if md.vote_deadline else ''}"
+                f" ({len(proposal_rows)} proposals updated)"
+            )
+        except Exception as exc:
+            console.print(f"  [red]{t} {accession}: {exc}[/red]")
+
+    console.print(f"\n[bold]Backfill complete:[/bold] {updated} proposal row(s) updated.")
+
+
+@click.command("seed-test-meeting")
+@click.option("--ticker", "-t", required=True, help="Ticker (must be in your portfolio)")
+@click.option("--days", "-d", default=7, show_default=True, help="Days from today")
+@click.option("--proposal-number", default="999", show_default=True)
+def seed_test_meeting(ticker: str, days: int, proposal_number: str) -> None:
+    """Insert a synthetic proposal whose meeting is N days away (for testing alerts)."""
+    _ensure_db()
+
+    from datetime import datetime, timedelta
+    from config import PORTFOLIO
+    from data.storage import upsert_proposal
+
+    ticker = ticker.upper()
+    if ticker not in PORTFOLIO:
+        console.print(f"[red]{ticker} is not in your portfolio.[/red]")
+        sys.exit(1)
+
+    meeting_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+    proposal_id = upsert_proposal(
+        ticker=ticker,
+        company_name=PORTFOLIO[ticker]["name"],
+        proposal_number=proposal_number,
+        title=f"[TEST] Synthetic proposal {days} days from today",
+        full_text="Test proposal seeded by seed-test-meeting; safe to delete.",
+        management_rec="FOR",
+        proposal_type="other",
+        source="manual",
+        meeting_date=meeting_date,
+        accession_number=f"TEST-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+    )
+    console.print(
+        f"[green]Seeded[/green] test proposal id={proposal_id} for {ticker}, "
+        f"meeting on {meeting_date} (T-{days})"
+    )
+
+
+@click.command("record-outcome")
+@click.option("--proposal-id", required=True, type=int, help="proposals.id")
+@click.option("--outcome", required=True, type=click.Choice(["FOR", "AGAINST", "ABSTAIN", "WITHHOLD"]))
+@click.option("--support-pct", default=None, type=float, help="Shareholder support percentage (0-100)")
+@click.option("--source", default="manual")
+def record_outcome(proposal_id: int, outcome: str, support_pct: float | None, source: str) -> None:
+    """Record the actual shareholder vote outcome for accuracy tracking."""
+    _ensure_db()
+
+    from data.storage import record_vote_outcome, get_accuracy_summary
+    record_vote_outcome(proposal_id, outcome, support_pct, source)
+
+    summary = get_accuracy_summary()
+    if summary["total_with_outcome"]:
+        console.print(
+            f"[green]Recorded.[/green] AI agreement with shareholder outcomes: "
+            f"{summary['agree_with_outcome']}/{summary['total_with_outcome']} "
+            f"({summary['agreement_pct']:.0%})"
+        )
+    else:
+        console.print("[green]Recorded.[/green]")
+
+
+@click.command("setup-local")
+@click.option("--url", default=None, help="LOCAL_LLM_URL (e.g. http://127.0.0.1:1234/v1)")
+@click.option("--model", default=None, help="LOCAL_LLM_MODEL")
+def setup_local(url: str | None, model: str | None) -> None:
+    """Verify the local-LLM backend (gbrain / LM Studio / llama-server / …) is reachable."""
+    url = url or os.getenv("LOCAL_LLM_URL", "")
+    model = model or os.getenv("LOCAL_LLM_MODEL", "")
+
+    if not url:
+        console.print(
+            "[bold red]LOCAL_LLM_URL not set.[/bold red]\n"
+            "Add to .env, e.g.:\n"
+            "  LLM_BACKEND=local\n"
+            "  LOCAL_LLM_URL=http://127.0.0.1:1234/v1\n"
+            "  LOCAL_LLM_MODEL=your-local-model-name\n"
+        )
+        return
+
+    console.print(
+        f"Testing local LLM at [bold]{url}[/bold] with model [bold]{model or 'default'}[/bold] …"
+    )
+    from agent.llm_backend import LocalLLMBackend
+    backend = LocalLLMBackend(url=url, model=model)
+    if backend.test_connection():
+        console.print("[green]OK[/green] — local LLM is reachable and responding.")
+    else:
+        console.print(
+            "[red]Failed.[/red] Check that the server is running and the URL/model are correct."
+        )
+
 
 @click.command("setup-gemini")
 @click.option("--model", "-m", default=None, help="Gemini model (default: gemini-2.5-flash-lite)")

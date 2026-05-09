@@ -95,29 +95,55 @@ class PreferenceEngine:
         user_vote: str,
         ai_recommendation: str,
         analyzer,
+        ai_reasoning: str = "",
+        user_note: str = "",
     ) -> None:
         """
         When a user overrides the AI recommendation, try to learn a preference.
         Only records when the user explicitly voted against the AI's recommendation.
+
+        Preserves the original AI reasoning and the user's note as a structured
+        context blob alongside the flattened NL preference statement, so the
+        provenance of every learned preference is auditable.
         """
-        if user_vote == ai_recommendation:
+        if user_vote.upper() == (ai_recommendation or "").upper():
             return  # No disagreement — nothing to learn
 
-        note = (
-            f"User voted {user_vote} (AI said {ai_recommendation}) on "
-            f"{ticker} proposal '{proposal_title}' (type: {proposal_type})"
-        )
-        statement = (
+        statement_parts = [
             f"For {proposal_type} proposals like '{proposal_title}' at companies "
-            f"like {ticker}, I prefer to vote {user_vote}."
-        )
+            f"like {ticker}, I prefer to vote {user_vote}.",
+        ]
+        if user_note:
+            statement_parts.append(f"My reason: {user_note}")
+        if ai_reasoning:
+            statement_parts.append(
+                f"The AI had recommended {ai_recommendation} because: {ai_reasoning}"
+            )
+        statement = " ".join(statement_parts)
+
         extracted = self.learn_from_statement(statement, analyzer)
+
+        # Always persist a structured trace under learned.<ticker>.<ptype>.context,
+        # so we don't lose the original reasoning even when extraction succeeds.
+        self.update(
+            key=f"learned.{ticker}.{proposal_type}.context",
+            value=json.dumps({
+                "vote": user_vote.upper(),
+                "ai_recommendation": (ai_recommendation or "").upper(),
+                "proposal": proposal_title,
+                "ai_reasoning": ai_reasoning,
+                "user_note": user_note,
+            }),
+            source="learned_vote",
+        )
+
         if not extracted:
-            # Store a raw note even if no structured preference could be extracted
+            # If structured extraction produced nothing, also store a coarse
+            # ticker/type fallback so the next analyze pass has something to use.
             self.update(
                 key=f"learned.{ticker}.{proposal_type}",
                 value=json.dumps(
-                    {"vote": user_vote, "proposal": proposal_title}
+                    {"vote": user_vote.upper(), "proposal": proposal_title}
                 ),
                 source="learned_vote",
             )
