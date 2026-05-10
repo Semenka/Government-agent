@@ -20,6 +20,7 @@ Usage:
   python main.py seed-test-meeting -t OXY -d 7  # synthetic test meeting
   python main.py record-outcome --proposal-id 5 --outcome FOR
   python main.py setup-local                  # verify local LLM (gbrain / LM Studio / …)
+  python main.py setup-ollama                 # verify Ollama is running and list models
   python main.py setup-gemini                 # verify Gemini API
 """
 
@@ -37,6 +38,7 @@ from ui.cli import (
     schedule_daemon,
     setup_gemini,
     setup_local,
+    setup_ollama,
     meeting_check,
     telegram_bot_cmd,
     backfill_meeting_dates,
@@ -78,6 +80,7 @@ cli.add_command(seed_test_meeting, name="seed-test-meeting")
 cli.add_command(record_outcome, name="record-outcome")
 cli.add_command(setup_gemini, name="setup-gemini")
 cli.add_command(setup_local, name="setup-local")
+cli.add_command(setup_ollama, name="setup-ollama")
 
 
 if __name__ == "__main__":

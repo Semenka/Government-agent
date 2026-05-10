@@ -12,6 +12,8 @@ Commands:
   digest       — run full pipeline once (fetch→analyze→email)
   schedule     — run as daemon, auto-trigger every Monday morning
   setup-gemini — verify Gemini API key and test the model
+  setup-local  — verify local LLM (gbrain / LM Studio / …)
+  setup-ollama — verify Ollama is running and list available models
 """
 
 import json
@@ -825,4 +827,63 @@ def setup_gemini(model: str | None) -> None:
         f"  LLM_BACKEND=gemini\n"
         f"  GEMINI_API_KEY={api_key[:8]}…\n"
         f"  GEMINI_MODEL={model}\n"
+    )
+
+
+@click.command("setup-ollama")
+@click.option("--url", default=None, help="Ollama URL (default: http://127.0.0.1:11434)")
+@click.option("--model", "-m", default=None, help="Model to test (default: OLLAMA_MODEL env or llama3.1:8b)")
+def setup_ollama(url: str | None, model: str | None) -> None:
+    """Verify Ollama is running and list available models."""
+    base_url = url or os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    test_model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
+    console.print(f"Checking Ollama at [bold]{base_url}[/bold] …")
+
+    import requests as _req
+    try:
+        r = _req.get(f"{base_url}/api/tags", timeout=5)
+        r.raise_for_status()
+        tags = r.json().get("models", [])
+    except Exception as exc:
+        console.print(
+            f"[bold red]Cannot reach Ollama.[/bold red] {exc}\n\n"
+            "Make sure Ollama is installed and running:\n"
+            "  ollama serve\n"
+            "Then pull a model:\n"
+            "  ollama pull llama3.1:8b\n"
+        )
+        return
+
+    if tags:
+        console.print(f"[green]Ollama is running.[/green] {len(tags)} model(s) installed:")
+        for m in tags:
+            name = m.get("name", m.get("model", "?"))
+            size_gb = m.get("size", 0) / 1e9
+            console.print(f"  • {name}  ({size_gb:.1f} GB)")
+    else:
+        console.print(
+            "[yellow]Ollama is running but no models are installed.[/yellow]\n"
+            "Pull a model first:\n"
+            "  ollama pull llama3.1:8b\n"
+        )
+        return
+
+    console.print(f"\nRunning inference test with [bold]{test_model}[/bold] …")
+    from agent.llm_backend import OllamaBackend
+    backend = OllamaBackend(url=base_url, model=test_model)
+    if backend.test_connection():
+        console.print(f"[green]Test passed.[/green] '{test_model}' is responding.")
+    else:
+        console.print(
+            f"[red]Test failed.[/red] Model '{test_model}' didn't respond.\n"
+            f"If the model name is different, pass it with --model or set OLLAMA_MODEL in .env."
+        )
+        return
+
+    console.print(
+        f"\n[bold]To use Ollama, set in your .env:[/bold]\n"
+        f"  LLM_BACKEND=ollama\n"
+        f"  OLLAMA_URL={base_url}\n"
+        f"  OLLAMA_MODEL={test_model}\n"
     )
